@@ -1,0 +1,950 @@
+# ==============================================================================
+# Todarodes pacificus Venom Gland Transcriptomics Analysis
+# 
+# Description: Differential expression and pathway enrichment analysis
+#              comparing venom glands (PSG, ASG) across 6 squid tissues
+#
+# Tissues: ASG (Accessory Salivary Gland), BM (Buccal Mass),
+#          PSG (Posterior Salivary Gland), SU_ms (Supraesophageal Mass),
+#          arm, eso (Esophagus)
+#
+# Input:  - kallisto_out_*/abundance.tsv (expression data)
+#         - tx2gene.tsv (transcript to gene mapping)
+#         - T_pacificus_*_mmseqs.emapper.annotations (EggNOG annotations)
+#
+# Output: - Normalized expression matrix
+#         - EggNOG annotation tables (filtered and merged)
+#         - GSEA results (GO BP/MF/CC, KEGG)
+#         - Visualization PDFs
+#
+# Author: [Your Name]
+# Date:   2025
+# ==============================================================================
+
+
+# ==============================================================================
+# SECTION 1: LIBRARIES AND CONFLICT RESOLUTION
+# ==============================================================================
+
+library(tximport)
+library(DESeq2)
+library(dplyr)
+library(rhdf5)
+library(clusterProfiler)
+library(enrichplot)
+library(tidyr)
+library(ggplot2)
+library(tibble)
+library(ggrepel)
+library(pheatmap)
+library(RColorBrewer)
+library(stringr)
+library(patchwork)
+library(conflicted)
+
+if (!require("GO.db", quietly = TRUE)) BiocManager::install("GO.db")
+library(GO.db)
+
+# Resolve package conflicts — dplyr wins for data manipulation
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::slice)
+conflicts_prefer(dplyr::rename)
+conflicts_prefer(dplyr::count)
+conflicts_prefer(dplyr::mutate)
+conflicts_prefer(dplyr::arrange)
+conflicts_prefer(dplyr::summarise)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(base::setdiff)
+conflicts_prefer(base::intersect)
+conflicts_prefer(base::union)
+
+
+# ==============================================================================
+# SECTION 2: CONFIGURATION
+# ==============================================================================
+
+# Tissue names must match kallisto output folder suffixes
+# e.g. kallisto_out_asg/, kallisto_out_BM/, etc.
+tissues <- c("asg", "BM", "PSG", "SU_ms", "arm", "eso")
+
+# EggNOG file name mapping (eggnog suffix → kallisto name)
+tissue_name_map <- data.frame(
+  eggnog_name   = c("Arm", "ASG", "BM", "Esophagus",
+                    "PSG", "Supraesophagous_mass"),
+  kallisto_name = c("arm", "asg", "BM", "eso", "PSG", "SU_ms"),
+  venom         = c(FALSE, TRUE,  FALSE, FALSE, TRUE,  FALSE)
+)
+
+# Standard EggNOG-mapper column names
+eggnog_cols <- c(
+  "Gene_ID", "seed_ortholog", "evalue", "score",
+  "eggNOG_OGs", "max_annot_lvl", "COG_category",
+  "Description", "Preferred_name", "GOs", "EC",
+  "KEGG_ko", "KEGG_Pathway", "KEGG_Module",
+  "KEGG_Reaction", "KEGG_rclass", "BRITE",
+  "KEGG_TC", "CAZy", "BiGG_Reaction", "PFAMs"
+)
+
+
+# ==============================================================================
+# SECTION 3: LOAD KALLISTO DATA
+# ==============================================================================
+
+cat("=== Loading Kallisto data ===\n")
+
+files <- paste0("kallisto_out_", tissues, "/abundance.tsv")
+names(files) <- tissues
+
+# Verify all files exist before proceeding
+file_check <- file.exists(files)
+print(data.frame(tissue = tissues, path = files, found = file_check))
+if (!all(file_check)) stop("Missing kallisto files — check folder names")
+
+# Sample metadata
+sample_table <- data.frame(
+  sample_name = tissues,
+  condition   = tissues,
+  venom       = c("venom", "non_venom", "venom",
+                  "non_venom", "non_venom", "non_venom"),
+  row.names   = tissues
+)
+
+# Load transcript-to-gene mapping
+tx2gene <- read.table("tx2gene.tsv", header = TRUE, sep = "\t")
+
+# Import kallisto quantification
+txi <- tximport(
+  files,
+  type            = "kallisto",
+  tx2gene         = tx2gene,
+  ignoreTxVersion = TRUE
+)
+
+cat(sprintf("Genes imported: %d\n", nrow(txi$counts)))
+cat(sprintf("Samples: %s\n", paste(colnames(txi$counts), collapse = ", ")))
+
+
+# ==============================================================================
+# SECTION 4: NORMALIZE COUNTS
+# ==============================================================================
+
+cat("\n=== Normalizing counts ===\n")
+
+dds_norm <- DESeqDataSetFromTximport(txi,
+                                      colData = sample_table,
+                                      design  = ~ 1)
+dds_norm          <- estimateSizeFactors(dds_norm)
+normalized_counts <- counts(dds_norm, normalized = TRUE)
+
+df_norm <- as.data.frame(normalized_counts) %>%
+  rownames_to_column("Gene_ID")
+
+write.csv(df_norm, "ALL_T_pacificus_Normalized_Genes.csv", row.names = FALSE)
+cat("Saved: ALL_T_pacificus_Normalized_Genes.csv\n")
+
+# Extract gene IDs for matching
+expr_ids <- rownames(normalized_counts)
+cat(sprintf("Total expression genes: %d\n", length(expr_ids)))
+
+
+# ==============================================================================
+# SECTION 5: VARIANCE STABILIZING TRANSFORMATION + FOLD CHANGE FILTER
+# ==============================================================================
+
+cat("\n=== VST transformation and fold change calculation ===\n")
+
+dds_vst <- DESeqDataSetFromTximport(txi,
+                                     colData = sample_table,
+                                     design  = ~ 1)
+dds_vst <- dds_vst[rowSums(counts(dds_vst)) >= 10, ]
+dds_vst <- estimateSizeFactors(dds_vst)
+vst_mat <- varianceStabilizingTransformation(dds_vst, blind = TRUE)
+
+# Calculate expression range across tissues (log2 scale)
+vst_df <- as.data.frame(assay(vst_mat)) %>%
+  rownames_to_column("Gene_ID")
+
+vst_fc <- vst_df %>%
+  rowwise() %>%
+  mutate(
+    max_vst    = max(c_across(all_of(tissues)), na.rm = TRUE),
+    min_vst    = min(c_across(all_of(tissues)), na.rm = TRUE),
+    range_log2 = max_vst - min_vst,
+    tissue_max = tissues[which.max(c_across(all_of(tissues)))],
+    tissue_min = tissues[which.min(c_across(all_of(tissues)))]
+  ) %>%
+  ungroup()
+
+# Genes with >= 1 log2 fold change (2-fold) across any tissue
+genes_1xFC <- vst_fc %>%
+  filter(range_log2 >= 1) %>%
+  pull(Gene_ID)
+
+cat(sprintf("Total VST genes:              %d\n", nrow(vst_fc)))
+cat(sprintf("Genes with >=2-fold variation: %d\n", length(genes_1xFC)))
+
+
+# ==============================================================================
+# SECTION 6: LOAD AND PROCESS EGGNOG ANNOTATIONS
+# ==============================================================================
+
+cat("\n=== Loading EggNOG annotations ===\n")
+
+# Helper: load a single EggNOG annotation file
+load_eggnog <- function(filepath, tissue_label = NULL) {
+  df <- read.table(
+    filepath,
+    header       = FALSE,
+    sep          = "\t",
+    comment.char = "#",
+    quote        = "",
+    fill         = TRUE,
+    na.strings   = c("", "-")
+  )
+  n_cols <- min(ncol(df), length(eggnog_cols))
+  colnames(df)[1:n_cols] <- eggnog_cols[1:n_cols]
+  if (!is.null(tissue_label)) df$source_tissue <- tissue_label
+  return(df)
+}
+
+# Build file paths and verify
+eggnog_files <- paste0("T_pacificus_", tissue_name_map$eggnog_name,
+                        "_mmseqs.emapper.annotations")
+names(eggnog_files) <- tissue_name_map$kallisto_name
+
+cat("EggNOG files:\n")
+for (i in seq_along(eggnog_files)) {
+  cat(sprintf("  %-8s : [%s]\n",
+              names(eggnog_files)[i],
+              ifelse(file.exists(eggnog_files[i]), "FOUND", "MISSING")))
+}
+
+# Load all tissue-specific EggNOG files
+eggnog_tissue_list <- list()
+for (i in seq_len(nrow(tissue_name_map))) {
+  kal_name <- tissue_name_map$kallisto_name[i]
+  filepath <- eggnog_files[kal_name]
+  if (file.exists(filepath)) {
+    eggnog_tissue_list[[kal_name]] <- load_eggnog(filepath,
+                                                    tissue_label = kal_name)
+    cat(sprintf("  Loaded %-8s: %d entries\n",
+                kal_name, nrow(eggnog_tissue_list[[kal_name]])))
+  }
+}
+
+# Combine and clean Gene IDs
+# EggNOG IDs have format: "TP_BM_TRINITY_DN44329_c0_g1_i1.p2"
+# Expression IDs have format: "TRINITY_DN44329_c0_g1"
+eggnog_combined <- bind_rows(eggnog_tissue_list) %>%
+  mutate(
+    Gene_ID_original = Gene_ID,
+    Gene_ID_clean    = gsub("^TP_[A-Za-z]+_", "", Gene_ID),
+    Gene_ID_clean    = gsub("_i[0-9]+\\.p[0-9]+$", "", Gene_ID_clean)
+  )
+
+# Report match rate
+after_match <- sum(eggnog_combined$Gene_ID_clean %in% expr_ids)
+cat(sprintf("\nID match rate after cleaning: %d / %d (%.1f%%)\n",
+            after_match, nrow(eggnog_combined),
+            100 * after_match / nrow(eggnog_combined)))
+
+# Deduplicate: keep best hit (lowest evalue) per gene
+eggnog_dedup <- eggnog_combined %>%
+  filter(Gene_ID_clean %in% expr_ids) %>%
+  mutate(
+    Gene_ID = Gene_ID_clean,
+    evalue  = suppressWarnings(as.numeric(evalue))
+  ) %>%
+  arrange(evalue) %>%
+  group_by(Gene_ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-Gene_ID_original, -Gene_ID_clean)
+
+# Filter to genes with >=2-fold variation
+eggnog_final <- eggnog_dedup %>%
+  filter(Gene_ID %in% genes_1xFC)
+
+cat(sprintf("Unique annotated genes:              %d\n", nrow(eggnog_dedup)))
+cat(sprintf("Annotated + >=2-fold variable genes: %d\n", nrow(eggnog_final)))
+
+# Save
+write.csv(eggnog_dedup,  "eggnog_all_genes_annotated.csv",    row.names = FALSE)
+write.csv(eggnog_final,  "eggnog_filtered_2fold_annotated.csv", row.names = FALSE)
+cat("Saved: eggnog_all_genes_annotated.csv\n")
+cat("Saved: eggnog_filtered_2fold_annotated.csv\n")
+
+
+# ==============================================================================
+# SECTION 7: BUILD ANNOTATION DATABASES FOR GSEA
+# ==============================================================================
+
+cat("\n=== Building GO and KEGG annotation databases ===\n")
+
+# --- GO terms ---
+go_annotations <- eggnog_dedup %>%
+  filter(!is.na(GOs)) %>%
+  select(Gene_ID, GOs) %>%
+  separate_rows(GOs, sep = ",") %>%
+  mutate(GOs = trimws(GOs)) %>%
+  filter(GOs != "", GOs != "-", grepl("^GO:", GOs)) %>%
+  rename(GO_ID = GOs)
+
+go_ids_present <- unique(go_annotations$GO_ID)
+term2gene_GO   <- go_annotations %>% select(GO_ID, Gene_ID)
+
+cat(sprintf("Genes with GO terms: %d\n", n_distinct(go_annotations$Gene_ID)))
+cat(sprintf("Unique GO terms:     %d\n", n_distinct(go_annotations$GO_ID)))
+
+# Get GO term names and ontology from GO.db
+cat("Looking up GO term names (1-2 minutes)...\n")
+go_lookup <- lapply(go_ids_present, function(goid) {
+  tryCatch({
+    term_obj <- GOTERM[[goid]]
+    if (!is.null(term_obj)) {
+      data.frame(
+        GO_ID       = goid,
+        GO_name     = Term(term_obj),
+        GO_ontology = Ontology(term_obj),
+        stringsAsFactors = FALSE
+      )
+    }
+  }, error = function(e) NULL)
+})
+term2name_GO <- do.call(rbind, go_lookup[!sapply(go_lookup, is.null)])
+
+# Split by ontology
+term2name_BP <- term2name_GO %>% filter(GO_ontology == "BP")
+term2name_MF <- term2name_GO %>% filter(GO_ontology == "MF")
+term2name_CC <- term2name_GO %>% filter(GO_ontology == "CC")
+term2gene_BP <- term2gene_GO %>% filter(GO_ID %in% term2name_BP$GO_ID)
+term2gene_MF <- term2gene_GO %>% filter(GO_ID %in% term2name_MF$GO_ID)
+term2gene_CC <- term2gene_GO %>% filter(GO_ID %in% term2name_CC$GO_ID)
+
+cat(sprintf("GO BP: %d terms | %d gene-term pairs\n",
+            nrow(term2name_BP), nrow(term2gene_BP)))
+cat(sprintf("GO MF: %d terms | %d gene-term pairs\n",
+            nrow(term2name_MF), nrow(term2gene_MF)))
+cat(sprintf("GO CC: %d terms | %d gene-term pairs\n",
+            nrow(term2name_CC), nrow(term2gene_CC)))
+
+# --- KEGG terms ---
+kegg_annotations <- eggnog_dedup %>%
+  filter(!is.na(KEGG_ko)) %>%
+  select(Gene_ID, KEGG_ko) %>%
+  separate_rows(KEGG_ko, sep = ",") %>%
+  mutate(KEGG_ko = trimws(KEGG_ko)) %>%
+  filter(KEGG_ko != "", KEGG_ko != "-", grepl("^ko:K", KEGG_ko))
+
+pathway_annotations <- eggnog_dedup %>%
+  filter(!is.na(KEGG_Pathway)) %>%
+  select(Gene_ID, KEGG_Pathway) %>%
+  separate_rows(KEGG_Pathway, sep = ",") %>%
+  mutate(KEGG_Pathway = trimws(KEGG_Pathway)) %>%
+  filter(KEGG_Pathway != "", KEGG_Pathway != "-",
+         grepl("^map", KEGG_Pathway))
+
+term2gene_KEGG    <- kegg_annotations   %>% select(KEGG_ko, Gene_ID)
+term2gene_PATHWAY <- pathway_annotations %>% select(KEGG_Pathway, Gene_ID)
+
+cat(sprintf("KEGG KO:  %d terms | %d gene-term pairs\n",
+            n_distinct(term2gene_KEGG$KEGG_ko), nrow(term2gene_KEGG)))
+cat(sprintf("KEGG PW:  %d terms | %d gene-term pairs\n",
+            n_distinct(term2gene_PATHWAY$KEGG_Pathway),
+            nrow(term2gene_PATHWAY)))
+
+# Background universe
+universe_genes <- unique(eggnog_dedup$Gene_ID)
+cat(sprintf("Universe: %d annotated genes\n", length(universe_genes)))
+
+# Save annotation databases
+save(
+  go_annotations,
+  term2gene_GO,  term2name_GO,
+  term2gene_BP,  term2name_BP,
+  term2gene_MF,  term2name_MF,
+  term2gene_CC,  term2name_CC,
+  term2gene_KEGG,
+  term2gene_PATHWAY,
+  universe_genes,
+  file = "custom_annotation_databases.RData"
+)
+cat("Saved: custom_annotation_databases.RData\n")
+
+
+# ==============================================================================
+# SECTION 8: BUILD RANKED GENE LISTS FOR GSEA
+# ==============================================================================
+
+cat("\n=== Building ranked gene lists ===\n")
+
+vst_clean <- as.data.frame(assay(vst_mat)) %>%
+  rownames_to_column("Gene_ID")
+
+# Rank score = target tissue VST - mean(all other tissues VST)
+make_ranked_list <- function(vst_df, target_tissue, all_tissues) {
+  other_tissues <- base::setdiff(all_tissues, target_tissue)
+  vst_df %>%
+    rowwise() %>%
+    mutate(
+      target_expr = get(target_tissue),
+      other_mean  = mean(c_across(all_of(other_tissues)), na.rm = TRUE),
+      rank_score  = target_expr - other_mean
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(rank_score)) %>%
+    arrange(desc(rank_score)) %>%
+    select(Gene_ID, rank_score)
+}
+
+# PSG vs ASG direct comparison
+make_ranked_psg_vs_asg <- function(vst_df) {
+  vst_df %>%
+    mutate(rank_score = PSG - asg) %>%
+    filter(!is.na(rank_score)) %>%
+    arrange(desc(rank_score)) %>%
+    select(Gene_ID, rank_score)
+}
+
+# Build ranked lists
+ranked_lists <- list()
+for (tis in tissues) {
+  ranked_lists[[tis]] <- make_ranked_list(vst_clean, tis, tissues)
+}
+ranked_lists[["PSG_vs_ASG"]] <- make_ranked_psg_vs_asg(vst_clean)
+
+# Convert to named numeric vectors
+make_gsea_vector <- function(ranked_df) {
+  vec <- ranked_df$rank_score
+  names(vec) <- ranked_df$Gene_ID
+  sort(vec, decreasing = TRUE)
+}
+gsea_vectors <- lapply(ranked_lists, make_gsea_vector)
+
+for (nm in names(gsea_vectors)) {
+  cat(sprintf("  %-12s : %d genes | top: %+.3f | bottom: %+.3f\n",
+              nm, length(gsea_vectors[[nm]]),
+              head(gsea_vectors[[nm]], 1),
+              tail(gsea_vectors[[nm]], 1)))
+}
+
+
+# ==============================================================================
+# SECTION 9: GSEA — GENE SET ENRICHMENT ANALYSIS
+# ==============================================================================
+
+cat("\n=== Running GSEA ===\n")
+
+# Core GSEA wrapper function
+run_gsea <- function(gsea_vector, term2gene, term2name = NULL,
+                      label = "comparison", pval = 0.20,
+                      min_gs = 10, max_gs = 500) {
+
+  cat(sprintf("  %-25s [%d genes] ... ", label, length(gsea_vector)))
+
+  result <- tryCatch({
+    GSEA(
+      geneList      = gsea_vector,
+      TERM2GENE     = term2gene,
+      TERM2NAME     = term2name,
+      minGSSize     = min_gs,
+      maxGSSize     = max_gs,
+      pvalueCutoff  = pval,
+      pAdjustMethod = "BH",
+      verbose       = FALSE,
+      seed          = 42
+    )
+  }, error = function(e) {
+    cat(sprintf("FAILED: %s\n", e$message))
+    return(NULL)
+  })
+
+  if (!is.null(result)) {
+    n  <- nrow(as.data.frame(result))
+    nU <- sum(as.data.frame(result)$NES > 0, na.rm = TRUE)
+    nD <- sum(as.data.frame(result)$NES < 0, na.rm = TRUE)
+    cat(sprintf("%d terms (+%d / -%d)\n", n, nU, nD))
+  }
+  return(result)
+}
+
+# Key comparisons
+comparisons <- c("PSG", "asg", "PSG_vs_ASG")
+
+# Run all four databases
+cat("--- GO Biological Process ---\n")
+gsea_BP <- lapply(setNames(comparisons, comparisons), function(comp) {
+  run_gsea(gsea_vectors[[comp]], term2gene_BP,
+           term2name_BP %>% select(GO_ID, GO_name),
+           label = paste("BP:", comp))
+})
+
+cat("--- GO Molecular Function ---\n")
+gsea_MF <- lapply(setNames(comparisons, comparisons), function(comp) {
+  run_gsea(gsea_vectors[[comp]], term2gene_MF,
+           term2name_MF %>% select(GO_ID, GO_name),
+           label = paste("MF:", comp))
+})
+
+cat("--- GO Cellular Component ---\n")
+gsea_CC <- lapply(setNames(comparisons, comparisons), function(comp) {
+  run_gsea(gsea_vectors[[comp]], term2gene_CC,
+           term2name_CC %>% select(GO_ID, GO_name),
+           label = paste("CC:", comp))
+})
+
+cat("--- KEGG Pathways ---\n")
+gsea_KEGG <- lapply(setNames(comparisons, comparisons), function(comp) {
+  run_gsea(gsea_vectors[[comp]], term2gene_PATHWAY,
+           label = paste("KEGG:", comp))
+})
+
+# Also run remaining tissues for heatmap
+remaining <- base::setdiff(tissues, comparisons)
+for (tis in remaining) {
+  gsea_BP[[tis]] <- run_gsea(
+    gsea_vectors[[tis]], term2gene_BP,
+    term2name_BP %>% select(GO_ID, GO_name),
+    label = paste("BP:", tis)
+  )
+}
+
+# Results summary
+cat("\n=== GSEA RESULTS SUMMARY ===\n")
+cat(sprintf("%-14s %6s %6s %6s %6s\n",
+            "Comparison", "GO BP", "GO MF", "GO CC", "KEGG"))
+cat(strrep("-", 44), "\n")
+for (comp in comparisons) {
+  cat(sprintf("%-14s %6d %6d %6d %6d\n",
+              comp,
+              ifelse(!is.null(gsea_BP[[comp]]),
+                     nrow(as.data.frame(gsea_BP[[comp]])), 0),
+              ifelse(!is.null(gsea_MF[[comp]]),
+                     nrow(as.data.frame(gsea_MF[[comp]])), 0),
+              ifelse(!is.null(gsea_CC[[comp]]),
+                     nrow(as.data.frame(gsea_CC[[comp]])), 0),
+              ifelse(!is.null(gsea_KEGG[[comp]]),
+                     nrow(as.data.frame(gsea_KEGG[[comp]])), 0)))
+}
+
+# Save GSEA result tables
+save_gsea <- function(result, filename) {
+  if (!is.null(result) && nrow(as.data.frame(result)) > 0) {
+    as.data.frame(result) %>%
+      arrange(p.adjust) %>%
+      mutate(direction = ifelse(NES > 0, "Enriched", "Depleted")) %>%
+      write.csv(filename, row.names = FALSE)
+    cat(sprintf("  Saved: %s\n", filename))
+  }
+}
+
+cat("\nSaving GSEA result tables...\n")
+save_gsea(gsea_BP[["PSG_vs_ASG"]],   "GSEA_BP_PSG_vs_ASG.csv")
+save_gsea(gsea_MF[["PSG_vs_ASG"]],   "GSEA_MF_PSG_vs_ASG.csv")
+save_gsea(gsea_CC[["PSG_vs_ASG"]],   "GSEA_CC_PSG_vs_ASG.csv")
+save_gsea(gsea_KEGG[["PSG_vs_ASG"]], "GSEA_KEGG_PSG_vs_ASG.csv")
+save_gsea(gsea_BP[["PSG"]],          "GSEA_BP_PSG_vs_all.csv")
+save_gsea(gsea_BP[["asg"]],          "GSEA_BP_ASG_vs_all.csv")
+save_gsea(gsea_KEGG[["PSG"]],        "GSEA_KEGG_PSG_vs_all.csv")
+save_gsea(gsea_KEGG[["asg"]],        "GSEA_KEGG_ASG_vs_all.csv")
+
+save(gsea_BP, gsea_MF, gsea_CC, gsea_KEGG,
+     file = "GSEA_results.RData")
+cat("Saved: GSEA_results.RData\n")
+
+
+# ==============================================================================
+# SECTION 10: VISUALIZATIONS
+# ==============================================================================
+
+cat("\n=== Generating visualizations ===\n")
+
+# Tissue color palette
+tissue_colors <- c(
+  "PSG"   = "darkred",
+  "asg"   = "firebrick",
+  "arm"   = "steelblue",
+  "BM"    = "forestgreen",
+  "eso"   = "orange",
+  "SU_ms" = "purple"
+)
+
+# --- PLOT 1: Dotplots (PSG vs ASG) ---
+
+clean_dotplot <- function(result, title, n_show = 20, label_wrap = 40) {
+
+  if (is.null(result) || nrow(as.data.frame(result)) == 0) {
+    message("  No terms to plot: ", title)
+    return(NULL)
+  }
+
+  df <- as.data.frame(result) %>%
+    arrange(p.adjust) %>%
+    slice(1:min(n_show, nrow(.))) %>%
+    mutate(
+      direction   = ifelse(NES > 0, "Enriched in PSG (+NES)",
+                                    "Enriched in ASG (-NES)"),
+      Description = str_wrap(Description, width = label_wrap),
+      Description = factor(Description, levels = Description[order(NES)])
+    )
+
+  ggplot(df, aes(x = NES, y = Description,
+                  size = setSize, color = p.adjust)) +
+    geom_point(alpha = 0.85) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_color_gradient(low = "firebrick", high = "grey80",
+                         name = "Adj. p-value") +
+    scale_size_continuous(name = "Gene set size", range = c(2, 10)) +
+    facet_wrap(~ direction, scales = "free_x", ncol = 2) +
+    theme_bw(base_size = 11) +
+    labs(title = title,
+         x     = "Normalized Enrichment Score (NES)",
+         y     = NULL) +
+    theme(
+      plot.title       = element_text(hjust = 0.5, face = "bold", size = 12),
+      axis.text.y      = element_text(size = 9),
+      strip.text       = element_text(face = "bold", size = 10),
+      strip.background = element_rect(fill = "grey92")
+    )
+}
+
+p_bp <- clean_dotplot(
+  gsea_BP[["PSG_vs_ASG"]],
+  "GO Biological Process: PSG vs ASG\n(+NES = PSG enriched | -NES = ASG enriched)",
+  n_show = 30
+)
+p_mf <- clean_dotplot(
+  gsea_MF[["PSG_vs_ASG"]],
+  "GO Molecular Function: PSG vs ASG",
+  n_show = 20
+)
+p_kegg <- clean_dotplot(
+  gsea_KEGG[["PSG_vs_ASG"]],
+  "KEGG Pathways: PSG vs ASG",
+  n_show = 20
+)
+
+pdf("GSEA_dotplot_BP_PSG_vs_ASG.pdf",   width = 16, height = 10)
+print(p_bp);   dev.off()
+pdf("GSEA_dotplot_MF_PSG_vs_ASG.pdf",   width = 14, height = 8)
+print(p_mf);   dev.off()
+pdf("GSEA_dotplot_KEGG_PSG_vs_ASG.pdf", width = 14, height = 8)
+print(p_kegg); dev.off()
+cat("  Saved: dotplots\n")
+
+# --- PLOT 2: NES Bar Charts ---
+
+nes_barplot <- function(result, title,
+                         tissue_pos = "PSG",
+                         tissue_neg = "ASG",
+                         n_show = 25, label_wrap = 45) {
+
+  if (is.null(result) || nrow(as.data.frame(result)) == 0) return(NULL)
+
+  df <- as.data.frame(result) %>%
+    filter(p.adjust < 0.05) %>%
+    arrange(NES)
+
+  if (nrow(df) == 0) {
+    message("  No significant terms (p.adj < 0.05): ", title)
+    return(NULL)
+  }
+
+  n_neg <- min(n_show %/% 2, sum(df$NES < 0))
+  n_pos <- min(n_show %/% 2, sum(df$NES > 0))
+  df <- df %>%
+    slice(c(1:n_neg, (nrow(.) - n_pos + 1):nrow(.))) %>%
+    mutate(
+      Description = str_wrap(Description, width = label_wrap),
+      Description = factor(Description, levels = Description),
+      direction   = ifelse(NES > 0,
+                           paste(tissue_pos, "enriched"),
+                           paste(tissue_neg, "enriched")),
+      sig_label   = case_when(
+        p.adjust < 0.001 ~ "***",
+        p.adjust < 0.01  ~ "**",
+        p.adjust < 0.05  ~ "*",
+        TRUE             ~ ""
+      )
+    )
+
+  ggplot(df, aes(x = NES, y = Description, fill = direction)) +
+    geom_bar(stat = "identity", width = 0.7, alpha = 0.85) +
+    geom_text(aes(label = sig_label,
+                  x     = NES + ifelse(NES > 0, 0.05, -0.05)),
+              hjust = ifelse(df$NES > 0, 0, 1), size = 4) +
+    geom_vline(xintercept = 0, color = "black", linewidth = 0.5) +
+    scale_fill_manual(
+      values = setNames(c("darkred", "steelblue"),
+                        c(paste(tissue_pos, "enriched"),
+                          paste(tissue_neg, "enriched"))),
+      name = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    labs(
+      title    = title,
+      subtitle = "* p<0.05  ** p<0.01  *** p<0.001 (BH-adjusted)",
+      x        = "Normalized Enrichment Score (NES)",
+      y        = NULL
+    ) +
+    theme(
+      plot.title    = element_text(hjust = 0.5, face = "bold", size = 12),
+      plot.subtitle = element_text(hjust = 0.5, size  = 9, color = "grey50"),
+      axis.text.y   = element_text(size  = 9),
+      legend.position = "top"
+    )
+}
+
+p_bar_bp   <- nes_barplot(gsea_BP[["PSG_vs_ASG"]],
+                            "GO Biological Process NES: PSG vs ASG")
+p_bar_kegg <- nes_barplot(gsea_KEGG[["PSG_vs_ASG"]],
+                            "KEGG Pathway NES: PSG vs ASG")
+p_bar_mf   <- nes_barplot(gsea_MF[["PSG_vs_ASG"]],
+                            "GO Molecular Function NES: PSG vs ASG")
+
+pdf("GSEA_NES_barplot_PSG_vs_ASG.pdf", width = 14, height = 10)
+if (!is.null(p_bar_bp))   print(p_bar_bp)
+if (!is.null(p_bar_kegg)) print(p_bar_kegg)
+if (!is.null(p_bar_mf))   print(p_bar_mf)
+dev.off()
+cat("  Saved: GSEA_NES_barplot_PSG_vs_ASG.pdf\n")
+
+# --- PLOT 3: GSEA Running Score Plots ---
+
+plot_running_scores <- function(gsea_result, n_terms = 6,
+                                  direction = "both") {
+
+  if (is.null(gsea_result) ||
+      nrow(as.data.frame(gsea_result)) == 0) return(list())
+
+  df <- as.data.frame(gsea_result) %>% arrange(p.adjust)
+
+  if (direction == "positive") df <- filter(df, NES > 0)
+  if (direction == "negative") df <- filter(df, NES < 0)
+  if (nrow(df) == 0) return(list())
+
+  top_ids <- slice(df, 1:min(n_terms, nrow(df))) %>% pull(ID)
+
+  plots <- lapply(top_ids, function(term_id) {
+    info <- filter(df, ID == term_id)[1, ]
+    tryCatch(
+      gseaplot2(
+        gsea_result,
+        geneSetID = term_id,
+        title     = str_wrap(
+          sprintf("%s\nNES=%.3f | p.adj=%.3g",
+                  info$Description, info$NES, info$p.adjust),
+          width = 55
+        ),
+        color     = ifelse(info$NES > 0, "darkred", "steelblue"),
+        base_size = 10
+      ),
+      error = function(e) NULL
+    )
+  })
+  plots[!sapply(plots, is.null)]
+}
+
+psg_plots <- plot_running_scores(gsea_BP[["PSG_vs_ASG"]],
+                                  n_terms = 3, direction = "positive")
+asg_plots <- plot_running_scores(gsea_BP[["PSG_vs_ASG"]],
+                                  n_terms = 6, direction = "negative")
+
+pdf("GSEA_running_scores_PSG_vs_ASG.pdf", width = 10, height = 7)
+for (p in c(psg_plots, asg_plots)) if (!is.null(p)) print(p)
+dev.off()
+cat("  Saved: GSEA_running_scores_PSG_vs_ASG.pdf\n")
+
+# --- PLOT 4: Side-by-Side PSG vs ASG ---
+
+psg_terms <- as.data.frame(gsea_BP[["PSG"]]) %>%
+  arrange(p.adjust) %>% slice(1:20) %>% mutate(tissue = "PSG")
+asg_terms <- as.data.frame(gsea_BP[["asg"]]) %>%
+  arrange(p.adjust) %>% slice(1:20) %>% mutate(tissue = "ASG")
+
+plot_df <- bind_rows(psg_terms, asg_terms) %>%
+  mutate(
+    Description = str_wrap(Description, 45),
+    Description = factor(Description,
+                         levels = unique(Description[order(NES)]))
+  )
+
+if (nrow(plot_df) > 0) {
+  p_side <- ggplot(plot_df,
+                    aes(x = NES, y = Description,
+                        fill = tissue, alpha = -log10(p.adjust))) +
+    geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+    geom_vline(xintercept = 0, color = "black") +
+    scale_fill_manual(values = c("PSG" = "darkred", "ASG" = "steelblue")) +
+    scale_alpha_continuous(range = c(0.4, 1.0),
+                           name  = "-log10(p.adj)") +
+    theme_bw(base_size = 11) +
+    labs(
+      title = "GO Biological Process: PSG and ASG\n(each tissue vs all others)",
+      x     = "NES", y = NULL, fill = "Tissue"
+    ) +
+    theme(
+      plot.title  = element_text(hjust = 0.5, face = "bold"),
+      axis.text.y = element_text(size = 8)
+    )
+
+  pdf("GSEA_BP_PSG_ASG_sidebyside.pdf", width = 14, height = 10)
+  print(p_side)
+  dev.off()
+  cat("  Saved: GSEA_BP_PSG_ASG_sidebyside.pdf\n")
+}
+
+# --- PLOT 5: NES Heatmap Across All Tissues ---
+
+all_results_df <- bind_rows(
+  lapply(tissues, function(tis) {
+    if (!is.null(gsea_BP[[tis]]) && nrow(as.data.frame(gsea_BP[[tis]])) > 0) {
+      as.data.frame(gsea_BP[[tis]]) %>%
+        select(Description, NES, p.adjust) %>%
+        mutate(tissue = tis)
+    }
+  })
+)
+
+sig_terms <- all_results_df %>%
+  filter(p.adjust < 0.05) %>%
+  pull(Description) %>%
+  unique()
+
+cat(sprintf("\n  Significant BP terms across all tissues: %d\n",
+            length(sig_terms)))
+
+if (length(sig_terms) >= 2) {
+
+  nes_matrix <- all_results_df %>%
+    filter(Description %in% sig_terms) %>%
+    select(Description, tissue, NES) %>%
+    pivot_wider(names_from  = tissue,
+                values_from = NES,
+                values_fill = 0) %>%
+    column_to_rownames("Description")
+
+  rownames(nes_matrix) <- str_trunc(rownames(nes_matrix), 60)
+
+  col_anno <- data.frame(
+    Tissue_Type = ifelse(tissues %in% c("PSG", "asg"),
+                         "Venom gland", "Non-venom"),
+    row.names   = tissues
+  )
+  col_anno <- col_anno[colnames(nes_matrix), , drop = FALSE]
+
+  pheatmap::pheatmap(
+    nes_matrix,
+    annotation_col    = col_anno,
+    annotation_colors = list(
+      Tissue_Type = c("Venom gland" = "firebrick",
+                      "Non-venom"   = "steelblue")
+    ),
+    color             = colorRampPalette(
+                          rev(brewer.pal(9, "RdBu")))(100),
+    clustering_method = "ward.D2",
+    fontsize_row      = 8,
+    fontsize_col      = 10,
+    main              = "GO BP Enrichment (NES) Across All Tissues",
+    angle_col         = 45,
+    border_color      = NA,
+    filename          = "GSEA_NES_heatmap_all_tissues.pdf",
+    width             = 12,
+    height            = max(8, nrow(nes_matrix) * 0.25)
+  )
+  cat("  Saved: GSEA_NES_heatmap_all_tissues.pdf\n")
+}
+
+# --- PLOT 6: Bubble Plot ---
+
+bubble_df <- as.data.frame(gsea_BP[["PSG_vs_ASG"]]) %>%
+  filter(p.adjust < 0.05) %>%
+  mutate(
+    direction   = ifelse(NES > 0, "PSG enriched", "ASG enriched"),
+    Description = str_wrap(Description, 40),
+    n_genes     = sapply(strsplit(core_enrichment, "/"), length)
+  ) %>%
+  group_by(direction) %>%
+  slice_min(p.adjust, n = 15) %>%
+  ungroup() %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = unique(Description)))
+
+if (nrow(bubble_df) > 0) {
+  p_bubble <- ggplot(
+    bubble_df,
+    aes(x     = NES,
+        y     = Description,
+        size  = n_genes,
+        color = direction,
+        alpha = -log10(p.adjust))
+  ) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    scale_color_manual(
+      values = c("PSG enriched" = "darkred",
+                 "ASG enriched" = "steelblue"),
+      name   = NULL
+    ) +
+    scale_size_continuous(name = "Core genes", range = c(3, 12)) +
+    scale_alpha_continuous(name = "-log10(p.adj)", range = c(0.5, 1.0)) +
+    facet_wrap(~ direction, scales = "free", ncol = 2) +
+    theme_bw(base_size = 11) +
+    labs(
+      title = "GO Biological Process Enrichment — PSG vs ASG\n(bubble size = core gene count)",
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title       = element_text(hjust = 0.5, face = "bold", size = 12),
+      axis.text.y      = element_text(size  = 8),
+      strip.text       = element_text(face  = "bold"),
+      strip.background = element_rect(fill  = "grey92"),
+      legend.position  = "right"
+    )
+
+  pdf("GSEA_bubble_PSG_vs_ASG.pdf", width = 16, height = 10)
+  print(p_bubble)
+  dev.off()
+  cat("  Saved: GSEA_bubble_PSG_vs_ASG.pdf\n")
+}
+
+
+# ==============================================================================
+# SECTION 11: SESSION SUMMARY
+# ==============================================================================
+
+cat("\n")
+cat("=======================================================\n")
+cat(" ANALYSIS COMPLETE\n")
+cat("=======================================================\n")
+cat("\nExpression data:\n")
+cat(sprintf("  Genes imported:           %d\n", nrow(txi$counts)))
+cat(sprintf("  Genes after VST filter:   %d\n", nrow(vst_fc)))
+cat(sprintf("  Genes >=2-fold variable:  %d\n", length(genes_1xFC)))
+cat("\nAnnotation coverage:\n")
+cat(sprintf("  EggNOG annotated genes:   %d (%.1f%%)\n",
+            nrow(eggnog_dedup),
+            100 * nrow(eggnog_dedup) / length(expr_ids)))
+cat(sprintf("  Annotated + variable:     %d\n", nrow(eggnog_final)))
+cat("\nOutput files:\n")
+cat("  ALL_T_pacificus_Normalized_Genes.csv\n")
+cat("  eggnog_all_genes_annotated.csv\n")
+cat("  eggnog_filtered_2fold_annotated.csv\n")
+cat("  custom_annotation_databases.RData\n")
+cat("  GSEA_results.RData\n")
+cat("  GSEA_BP/MF/CC/KEGG_PSG_vs_ASG.csv\n")
+cat("  GSEA_BP/KEGG_PSG_vs_all.csv\n")
+cat("  GSEA_BP/KEGG_ASG_vs_all.csv\n")
+cat("  GSEA_dotplot_BP/MF/KEGG_PSG_vs_ASG.pdf\n")
+cat("  GSEA_NES_barplot_PSG_vs_ASG.pdf\n")
+cat("  GSEA_running_scores_PSG_vs_ASG.pdf\n")
+cat("  GSEA_BP_PSG_ASG_sidebyside.pdf\n")
+cat("  GSEA_NES_heatmap_all_tissues.pdf\n")
+cat("  GSEA_bubble_PSG_vs_ASG.pdf\n")
+
+cat("\nR session info saved to: session_info.txt\n")
+sink("session_info.txt")
+sessionInfo()
+sink()
