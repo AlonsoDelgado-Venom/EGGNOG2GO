@@ -1,0 +1,703 @@
+# ==============================================================
+# WGCNA — TF Regulators of CRISP in T. pacificus
+# Builds on existing DESeq2 pipeline output
+# ==============================================================
+
+# ── Libraries ─────────────────────────────────────────────────
+library(WGCNA)
+library(DESeq2)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(stringr)
+library(igraph)
+library(ggraph)
+library(reshape2)
+library(gridExtra)
+library(viridis)
+
+options(stringsAsFactors = FALSE)
+enableWGCNAThreads()
+
+# ==============================================================
+# SECTION 1: Prepare Expression Matrix
+# ==============================================================
+
+# NOTE: vst_mat must be a DESeqTransform object from your
+#       existing DESeq2 pipeline
+
+vst_matrix <- assay(vst_mat)
+
+cat(sprintf("VST matrix: %d genes x %d samples\n",
+            nrow(vst_matrix), ncol(vst_matrix)))
+
+# WGCNA requires: rows = samples, cols = genes
+datExpr <- t(vst_matrix)
+
+cat(sprintf("datExpr: %d samples x %d genes\n",
+            nrow(datExpr), ncol(datExpr)))
+
+# ==============================================================
+# SECTION 2: Quality Control
+# ==============================================================
+
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0)
+    cat(sprintf("Removing %d bad genes\n",   sum(!gsg$goodGenes)))
+  if (sum(!gsg$goodSamples) > 0)
+    cat(sprintf("Removing %d bad samples\n", sum(!gsg$goodSamples)))
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+cat(sprintf("After QC: %d samples x %d genes\n",
+            nrow(datExpr), ncol(datExpr)))
+
+# Sample clustering — check for outliers
+sampleTree <- hclust(dist(datExpr), method = "average")
+
+pdf("WGCNA_sample_clustering.pdf", width = 8, height = 5)
+par(cex = 1.0, mar = c(0, 4, 2, 0))
+plot(sampleTree,
+     main     = "Sample clustering — check for outliers",
+     sub      = "",
+     xlab     = "",
+     cex.lab  = 1.5,
+     cex.axis = 1.5,
+     cex.main = 2)
+dev.off()
+cat("Saved: WGCNA_sample_clustering.pdf\n")
+
+# ==============================================================
+# SECTION 3: Soft Threshold Selection
+# NOTE: With only 6 samples, R² < 0.80 is expected.
+#       Power = 6 is used as fallback in that case.
+# ==============================================================
+
+powers <- 1:20
+
+sft <- pickSoftThreshold(
+  datExpr,
+  powerVector = powers,
+  networkType = "signed",
+  verbose     = 5
+)
+
+pdf("WGCNA_soft_threshold.pdf", width = 10, height = 5)
+par(mfrow = c(1, 2))
+
+# Scale-free topology fit
+plot(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     xlab = "Soft Threshold (power)",
+     ylab = "Scale Free Topology R²",
+     main = "Scale independence",
+     type = "n")
+text(sft$fitIndices[, 1],
+     -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2],
+     labels = powers, col = "red")
+abline(h = 0.80, col = "red")
+
+# Mean connectivity
+plot(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     xlab = "Soft Threshold (power)",
+     ylab = "Mean Connectivity",
+     main = "Mean connectivity",
+     type = "n")
+text(sft$fitIndices[, 1],
+     sft$fitIndices[, 5],
+     labels = powers, col = "red")
+dev.off()
+cat("Saved: WGCNA_soft_threshold.pdf\n")
+
+# Choose first power where R² > 0.80
+chosen_power <- sft$fitIndices %>%
+  as.data.frame() %>%
+  mutate(fit = -sign(SFT.R.sq) * slope) %>%
+  filter(fit > 0.80) %>%
+  slice(1) %>%
+  pull(Power)
+
+if (length(chosen_power) == 0) {
+  chosen_power <- 6
+  cat("WARNING: R² < 0.80 — using power = 6\n")
+  cat("This is expected with only 6 samples\n")
+} else {
+  cat(sprintf("Chosen soft power: %d\n", chosen_power))
+}
+
+# ==============================================================
+# SECTION 4: Build Network
+# ==============================================================
+
+# Force WGCNA::cor to avoid conflicts with stats::cor
+cor <- WGCNA::cor
+
+net <- blockwiseModules(
+  datExpr,
+  power             = chosen_power,
+  networkType       = "signed",
+  TOMType           = "signed",
+  minModuleSize     = 15,
+  mergeCutHeight    = 0.25,
+  numericLabels     = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs          = TRUE,
+  saveTOMFileBase   = "WGCNA_TOM",
+  maxBlockSize      = 10000,
+  verbose           = 3,
+  randomSeed        = 42
+)
+
+rm(cor)   # Restore default cor
+
+# Module summary
+moduleColors  <- labels2colors(net$colors)
+table_modules <- table(moduleColors)
+
+cat("\nModule summary:\n")
+print(table_modules)
+cat(sprintf("Total modules detected: %d\n",
+            length(unique(net$colors)) - 1))
+
+# Save module assignments
+module_df <- data.frame(
+  Gene_ID      = colnames(datExpr),
+  module_num   = net$colors,
+  module_color = moduleColors,
+  stringsAsFactors = FALSE
+)
+
+write.csv(module_df,
+          "WGCNA_gene_module_assignments.csv",
+          row.names = FALSE)
+cat("Saved: WGCNA_gene_module_assignments.csv\n")
+
+# ==============================================================
+# SECTION 5: Module Eigengenes & Trait Correlations
+# ==============================================================
+
+cat("\n=== Module Eigengenes ===\n")
+
+MEs_unordered <- moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs           <- orderMEs(MEs_unordered)
+
+# Binary tissue trait matrix (1 = is that tissue, 0 = not)
+trait_matrix <- matrix(0,
+                       nrow = nrow(datExpr),
+                       ncol = length(tissues))
+rownames(trait_matrix) <- rownames(datExpr)
+colnames(trait_matrix) <- tissues
+
+for (tis in tissues) {
+  if (tis %in% rownames(trait_matrix))
+    trait_matrix[tis, tis] <- 1
+}
+
+trait_df <- as.data.frame(trait_matrix)
+
+# Correlate eigengenes with tissue traits
+cor <- WGCNA::cor
+moduleTraitCor <- WGCNA::cor(MEs, trait_df,
+                              use = "pairwise.complete.obs")
+rm(cor)
+
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor,
+                                      nrow(datExpr))
+
+# Heatmap of module-trait relationships
+pdf("WGCNA_module_trait_heatmap.pdf",
+    width  = 10,
+    height = max(6, nrow(moduleTraitCor) * 0.3))
+
+textMatrix <- paste(signif(moduleTraitCor, 2), "\n(",
+                    signif(moduleTraitPvalue, 1), ")",
+                    sep = "")
+dim(textMatrix) <- dim(moduleTraitCor)
+
+par(mar = c(6, 8.5, 3, 3))
+labeledHeatmap(
+  Matrix        = moduleTraitCor,
+  xLabels       = colnames(trait_df),
+  yLabels       = names(MEs),
+  ySymbols      = names(MEs),
+  colorLabels   = FALSE,
+  colors        = blueWhiteRed(50),
+  textMatrix    = textMatrix,
+  setStdMargins = FALSE,
+  cex.text      = 0.5,
+  zlim          = c(-1, 1),
+  main          = "Module-tissue relationships"
+)
+dev.off()
+cat("Saved: WGCNA_module_trait_heatmap.pdf\n")
+
+# Modules correlated with PSG
+psg_module_cors <- data.frame(
+  module   = gsub("ME", "", rownames(moduleTraitCor)),
+  PSG_cor  = moduleTraitCor[, "PSG"],
+  PSG_pval = moduleTraitPvalue[, "PSG"]
+) %>%
+  arrange(desc(abs(PSG_cor)))
+
+cat("\nTop modules correlated with PSG:\n")
+print(head(psg_module_cors, 10))
+
+# ==============================================================
+# SECTION 6: Identify CRISP Module
+# ==============================================================
+
+cat("\n=== Finding CRISP Module ===\n")
+
+crisp_genes <- eggnog_dedup %>%
+  filter(
+    grepl("CRISP|cysteine.rich secretory|CAP domain",
+          Description, ignore.case = TRUE) |
+    grepl("CRISP|CAP",
+          Preferred_name, ignore.case = TRUE)
+  ) %>%
+  pull(Gene_ID)
+
+# Keep only genes that passed the TPM filter
+crisp_genes <- crisp_genes[crisp_genes %in% colnames(datExpr)]
+
+cat(sprintf("CRISP genes in dataset: %d\n", length(crisp_genes)))
+print(crisp_genes)
+
+# Module distribution of CRISP genes
+crisp_modules <- module_df %>%
+  filter(Gene_ID %in% crisp_genes) %>%
+  group_by(module_color, module_num) %>%
+  summarise(
+    n_crisp = n(),
+    genes   = paste(Gene_ID, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_crisp))
+
+cat("\nCRISP module distribution:\n")
+print(crisp_modules)
+
+cat("\nPSG-correlated modules:\n")
+print(head(psg_module_cors, 5))
+
+# Focal module = module with the most CRISP genes
+focal_module_color <- crisp_modules$module_color[1]
+focal_module_num   <- crisp_modules$module_num[1]
+
+cat(sprintf("\nFocal module: %s (module %d)\n",
+            focal_module_color, focal_module_num))
+cat(sprintf("PSG correlation: %.3f (p = %.3f)\n",
+            psg_module_cors$PSG_cor[
+              psg_module_cors$module == focal_module_color],
+            psg_module_cors$PSG_pval[
+              psg_module_cors$module == focal_module_color]))
+
+# All genes in focal module
+crisp_module_genes <- module_df %>%
+  filter(module_color == focal_module_color) %>%
+  pull(Gene_ID)
+
+cat(sprintf("Total genes in focal module (%s): %d\n",
+            focal_module_color, length(crisp_module_genes)))
+
+# ==============================================================
+# SECTION 7: Module Membership (kME)
+# ==============================================================
+
+cat("\n=== Calculating Module Membership ===\n")
+
+focal_ME_name <- paste0("ME", focal_module_color)
+
+kME <- WGCNA::cor(
+  datExpr,
+  MEs[[focal_ME_name]],
+  use = "pairwise.complete.obs"
+)
+
+kME_df <- data.frame(
+  Gene_ID = rownames(kME),
+  kME     = kME[, 1],
+  stringsAsFactors = FALSE
+)
+
+# NOTE: 'tpm' below = your TPM matrix object.
+#       Change to 'tpm_matrix' or whatever it is named
+#       in your environment if needed.
+kME_annotated <- kME_df %>%
+  filter(Gene_ID %in% crisp_module_genes) %>%
+  left_join(
+    eggnog_dedup %>%
+      select(Gene_ID, Description,
+             Preferred_name, COG_category),
+    by = "Gene_ID"
+  ) %>%
+  left_join(
+    as.data.frame(tpm) %>%        # <── rename if needed
+      rownames_to_column("Gene_ID"),
+    by = "Gene_ID"
+  ) %>%
+  mutate(
+    gene_label = case_when(
+      !is.na(Preferred_name) ~ Preferred_name,
+      !is.na(Description)    ~ str_trunc(Description, 35),
+      TRUE                   ~ Gene_ID
+    ),
+    is_crisp = Gene_ID %in% crisp_genes,
+    is_tf    = Gene_ID %in% tf_in_module$Gene_ID
+  ) %>%
+  arrange(desc(kME))
+
+cat("\nTop 20 hub genes:\n")
+kME_annotated %>%
+  select(Gene_ID, gene_label, kME, is_crisp, is_tf) %>%
+  head(20) %>%
+  print()
+
+cat("\nTop TFs by module membership:\n")
+kME_annotated %>%
+  filter(is_tf == TRUE) %>%
+  select(Gene_ID, gene_label, kME) %>%
+  head(10) %>%
+  print()
+
+cat(sprintf("\nCRISP genes in focal module: %d / %d total\n",
+            sum(kME_annotated$is_crisp),
+            nrow(kME_annotated)))
+
+write.csv(kME_annotated,
+          "WGCNA_kME_CRISP_module.csv",
+          row.names = FALSE)
+cat("Saved: WGCNA_kME_CRISP_module.csv\n")
+
+# ==============================================================
+# SECTION 8: PSG-Specific TF Analysis
+# ==============================================================
+
+cat("\n=== PSG-Specific TF Analysis ===\n")
+
+# Genes highly expressed in PSG only
+psg_specific <- as.data.frame(vst_matrix) %>%
+  rownames_to_column("Gene_ID") %>%
+  filter(
+    PSG > 6,   # high in PSG
+    asg < 3,   # low in accessory gland
+    BM  < 3    # low in book lung / muscle
+  )
+
+cat("PSG-specific genes:", nrow(psg_specific), "\n")
+
+# Identify TFs using EggNOG annotations
+psg_tfs <- eggnog_dedup %>%
+  filter(Gene_ID %in% psg_specific$Gene_ID) %>%
+  filter(
+    COG_category == "K" |
+    grepl(paste("transcription factor", "zinc finger",
+                "homeobox", "helix-loop-helix",
+                "leucine zipper", "GATA",
+                "nuclear receptor", "Myb", "Fox",
+                "Sox", "Hox", "Kruppel", "bZIP", "bHLH",
+                sep = "|"),
+          Description, ignore.case = TRUE)
+  ) %>%
+  left_join(psg_specific %>% select(Gene_ID, PSG, asg, BM),
+            by = "Gene_ID") %>%
+  arrange(desc(PSG))
+
+cat(sprintf("\nPSG-specific TFs found: %d\n", nrow(psg_tfs)))
+print(psg_tfs %>%
+        select(Gene_ID, Preferred_name,
+               Description, COG_category,
+               PSG, asg, BM))
+
+# TF type breakdown
+cat("\nTF categories:\n")
+psg_tfs %>%
+  mutate(TF_type = case_when(
+    grepl("zinc finger",       Description, ignore.case = TRUE) ~ "Zinc Finger",
+    grepl("homeobox|hox",      Description, ignore.case = TRUE) ~ "Homeobox",
+    grepl("bHLH|helix-loop",   Description, ignore.case = TRUE) ~ "bHLH",
+    grepl("bZIP|leucine zip",  Description, ignore.case = TRUE) ~ "bZIP",
+    grepl("nuclear receptor",  Description, ignore.case = TRUE) ~ "Nuclear Receptor",
+    grepl("circadian",         Description, ignore.case = TRUE) ~ "Circadian",
+    grepl("chromatin|histone", Description, ignore.case = TRUE) ~ "Chromatin",
+    TRUE ~ "Other K/Transcription"
+  )) %>%
+  count(TF_type) %>%
+  arrange(desc(n)) %>%
+  print()
+
+# Strictly PSG-only TFs
+cat("\nStrictly PSG-only TFs (asg < 1, BM < 1):\n")
+psg_tfs %>%
+  filter(asg < 1, BM < 1) %>%
+  select(Gene_ID, Preferred_name,
+         Description, PSG, asg, BM) %>%
+  arrange(desc(PSG)) %>%
+  print()
+
+# ==============================================================
+# SECTION 9: TF–Venom Co-expression Networks
+# ==============================================================
+
+cat("\n=== TF-Venom Co-expression Networks ===\n")
+
+real_tfs <- c(
+  "TRINITY_DN2288_c2_g1",   # ligand-activated TF
+  "TRINITY_DN4668_c0_g1",   # protein secretion
+  "TRINITY_DN13180_c0_g1"   # homeodomain TF
+)
+
+# Use full VST expression (captures graded expression)
+full_expr <- t(vst_matrix)
+
+tf_networks <- list()
+
+for (tf in real_tfs) {
+  cors <- WGCNA::cor(
+    full_expr,
+    full_expr[, tf],
+    use = "pairwise.complete.obs"
+  )
+
+  tf_networks[[tf]] <- data.frame(
+    TF      = tf,
+    Gene_ID = rownames(cors),
+    cor     = cors[, 1]
+  ) %>%
+    filter(Gene_ID != tf, cor > 0.95) %>%
+    arrange(desc(cor)) %>%
+    left_join(
+      eggnog_dedup %>%
+        select(Gene_ID, Description, Preferred_name),
+      by = "Gene_ID"
+    ) %>%
+    left_join(
+      as.data.frame(vst_matrix) %>%
+        rownames_to_column("Gene_ID") %>%
+        select(Gene_ID, PSG, asg, BM),
+      by = "Gene_ID"
+    )
+
+  cat(sprintf("TF %s: %d co-expressed genes (cor > 0.95)\n",
+              tf, nrow(tf_networks[[tf]])))
+}
+
+# Top 20 genes per TF
+for (tf in real_tfs) {
+  cat(sprintf("\n=== %s ===\n", tf))
+  tf_networks[[tf]] %>%
+    head(20) %>%
+    select(Gene_ID, Preferred_name,
+           Description, cor, PSG, asg, BM) %>%
+    print()
+}
+
+# Focus on DN4668 — most biologically interesting
+dn4668_network <- tf_networks[["TRINITY_DN4668_c0_g1"]]
+options(width = 200)
+
+cat("\nDN4668 — venom candidates:\n")
+dn4668_network %>%
+  filter(grepl(paste("venom", "toxin", "trypsin", "chitin",
+                     "protease", "metalloprotease",
+                     "phospholipase", "serine protease",
+                     "defensin", "inhibitor", "lectin",
+                     "CAP", "CRISP", sep = "|"),
+               Description, ignore.case = TRUE)) %>%
+  select(Gene_ID, Description, cor, PSG) %>%
+  arrange(desc(PSG)) %>%
+  as.data.frame() %>%
+  print()
+
+cat("\nFunctional breakdown of PSG > 8 genes in DN4668 network:\n")
+dn4668_network %>%
+  filter(PSG > 8) %>%
+  mutate(category = case_when(
+    grepl("vesicle|exocyst|clathrin|golgi|rab|snare|syntaxin|trafficking",
+          Description, ignore.case = TRUE) ~ "Secretory pathway",
+    grepl("venom|toxin|trypsin|chitin|protease|phospholipase|defensin|inhibitor",
+          Description, ignore.case = TRUE) ~ "Venom candidate",
+    grepl("transporter|solute carrier|SLC|channel",
+          Description, ignore.case = TRUE) ~ "Transporter",
+    grepl("kinase|phosphatase|signaling|receptor",
+          Description, ignore.case = TRUE) ~ "Signaling",
+    is.na(Description) ~ "Unannotated",
+    TRUE ~ "Other"
+  )) %>%
+  count(category) %>%
+  arrange(desc(n)) %>%
+  print()
+
+# Save all networks
+write.csv(tf_networks[["TRINITY_DN2288_c2_g1"]],
+          "PSG_network_DN2288_ligandTF.csv",        row.names = FALSE)
+write.csv(tf_networks[["TRINITY_DN4668_c0_g1"]],
+          "PSG_network_DN4668_secretionTF.csv",     row.names = FALSE)
+write.csv(tf_networks[["TRINITY_DN13180_c0_g1"]],
+          "PSG_network_DN13180_homeodomainTF.csv",  row.names = FALSE)
+write.csv(dn4668_network,
+          "PSG_DN4668_full_network.csv",            row.names = FALSE)
+cat("All networks saved!\n")
+
+# TF × venom gene correlation summary
+tf_venom_summary <- as.data.frame(tf_venom_cors) %>%
+  rownames_to_column("TF_Gene_ID") %>%
+  left_join(
+    eggnog_dedup %>% select(Gene_ID, Description),
+    by = c("TF_Gene_ID" = "Gene_ID")
+  ) %>%
+  mutate(
+    mean_venom_cor = rowMeans(
+      select(., TRINITY_DN601_c0_g1,
+             TRINITY_DN12032_c0_g1,
+             TRINITY_DN5113_c0_g2)
+    )
+  ) %>%
+  arrange(desc(mean_venom_cor)) %>%
+  select(TF_Gene_ID, Description,
+         TRINITY_DN601_c0_g1,
+         TRINITY_DN12032_c0_g1,
+         TRINITY_DN5113_c0_g2,
+         mean_venom_cor)
+
+cat("Top TFs ranked by mean venom correlation:\n")
+print(tf_venom_summary)
+
+write.csv(tf_venom_summary,
+          "TF_venom_correlations.csv",
+          row.names = FALSE)
+cat("Saved: TF_venom_correlations.csv\n")
+
+# ==============================================================
+# SECTION 10: Figures
+# ==============================================================
+
+cat("\n=== Generating Figures ===\n")
+
+# ── Panel A: TF × Venom Correlation Heatmap ───────────────────
+
+plot_tfs <- tf_venom_summary %>%
+  slice(1:6) %>%
+  mutate(TF_label = c(
+    "DN4668 (protein secretion)",
+    "DN13180 (homeodomain TF)",
+    "DN1363 (dsRNA binding)",
+    "DN4 (zinc finger)",
+    "DN19808 (FYVE zinc finger)",
+    "DN2781 (ZF RNA binding)"
+  ))
+
+cor_matrix <- plot_tfs %>%
+  select(TF_label,
+         TRINITY_DN601_c0_g1,
+         TRINITY_DN12032_c0_g1,
+         TRINITY_DN5113_c0_g2) %>%
+  melt(id.vars      = "TF_label",
+       variable.name = "Venom_Gene",
+       value.name    = "Correlation") %>%
+  mutate(Venom_Gene = recode(
+    Venom_Gene,
+    "TRINITY_DN601_c0_g1"   = "DN601\n(vault/trypsin)",
+    "TRINITY_DN12032_c0_g1" = "DN12032\n(chitin-binding)",
+    "TRINITY_DN5113_c0_g2"  = "DN5113\n(phospholipase C)"
+  ))
+
+pA <- ggplot(cor_matrix,
+             aes(x = Venom_Gene, y = TF_label,
+                 fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(Correlation, 2)),
+            size = 3.5, color = "white") +
+  scale_fill_viridis(option = "magma",
+                     limits = c(0.5, 1),
+                     name   = "Pearson r") +
+  labs(title = "A) TF - Venom Gene Correlations",
+       x     = "Venom Gene",
+       y     = "Transcription Factor") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 9),
+        axis.text.y = element_text(size = 9),
+        plot.title  = element_text(face = "bold", size = 11))
+
+# ── Panel B: Expression Heatmap across tissues ────────────────
+
+genes_to_plot <- c(
+  "TRINITY_DN4668_c0_g1",
+  "TRINITY_DN13180_c0_g1",
+  "TRINITY_DN1363_c0_g3",
+  "TRINITY_DN4_c2_g1",
+  "TRINITY_DN601_c0_g1",
+  "TRINITY_DN12032_c0_g1",
+  "TRINITY_DN5113_c0_g2",
+  "TRINITY_DN1573_c1_g1"
+)
+
+gene_labels <- c(
+  "TRINITY_DN4668_c0_g1"  = "DN4668 (protein secretion) [TF]",
+  "TRINITY_DN13180_c0_g1" = "DN13180 (homeodomain TF) [TF]",
+  "TRINITY_DN1363_c0_g3"  = "DN1363 (dsRNA binding) [TF]",
+  "TRINITY_DN4_c2_g1"     = "DN4 (zinc finger) [TF]",
+  "TRINITY_DN601_c0_g1"   = "DN601 (vault/trypsin) [Venom]",
+  "TRINITY_DN12032_c0_g1" = "DN12032 (chitin-binding) [Venom]",
+  "TRINITY_DN5113_c0_g2"  = "DN5113 (phospholipase C) [Venom]",
+  "TRINITY_DN1573_c1_g1"  = "DN1573 (CRISP2) [Venom]"
+)
+
+tissue_labels <- c(
+  "PSG"   = "PSG", "asg"  = "ASG",
+  "BM"    = "BM",  "SU_ms" = "SU",
+  "arm"   = "ARM", "eso"  = "ESO"
+)
+
+expr_plot <- vst_matrix[genes_to_plot, ] %>%
+  as.data.frame() %>%
+  rownames_to_column("Gene_ID") %>%
+  melt(id.vars      = "Gene_ID",
+       variable.name = "Tissue",
+       value.name    = "VST_expr") %>%
+  mutate(
+    Gene_label   = recode(Gene_ID,   !!!gene_labels),
+    Tissue_label = recode(Tissue,    !!!tissue_labels),
+    Gene_type    = ifelse(grepl("TF", Gene_label), "TF", "Venom"),
+    Gene_label   = factor(Gene_label, levels = rev(gene_labels)),
+    Tissue_label = factor(Tissue_label,
+                          levels = c("PSG", "ASG", "BM",
+                                     "SU",  "ARM", "ESO"))
+  )
+
+pB <- ggplot(expr_plot,
+             aes(x = Tissue_label, y = Gene_label,
+                 fill = VST_expr)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(VST_expr, 1)),
+            size = 3, color = "white") +
+  scale_fill_viridis(option = "plasma",
+                     name   = "VST\nexpression") +
+  facet_grid(Gene_type ~ .,
+             scales = "free_y",
+             space  = "free_y") +
+  labs(title = "B) Expression Across Tissues",
+       x     = "Tissue",
+       y     = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 9),
+        axis.text.y = element_text(size = 9),
+        strip.text  = element_text(face = "bold", size = 10),
+        plot.title  = element_text(face = "bold", size = 11))
+
+# ── Save combined figure ───────────────────────────────────────
+
+combined <- grid.arrange(pA, pB, ncol = 2, widths = c(1, 1.2))
+
+ggsave("TF_Venom_Network_Figure.pdf",
+       combined, width = 14, height = 7)
+ggsave("TF_Venom_Network_Figure.png",
+       combined, width = 14, height = 7, dpi = 300)
+
+cat("Saved: TF_Venom_Network_Figure.pdf / .png\n")
+cat("\n=== Analysis complete ===\n")
