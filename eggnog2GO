@@ -40,6 +40,7 @@ library(clusterProfiler)
 library(enrichplot)
 library(WGCNA)
 library(conflicted)
+library(cowplot) 
 
 if (!require("GO.db", quietly = TRUE)) BiocManager::install("GO.db")
 library(GO.db)
@@ -1018,6 +1019,9 @@ write.csv(cluster_annotated,
 cat("Saved: venom_genes_clusters.csv\n")
 
 
+
+
+
 # ==============================================================================
 # SECTION 14: PCA OF VENOM GENES
 # ==============================================================================
@@ -1040,12 +1044,6 @@ tissue_pca_positions <- as.data.frame(pca_res$x[, 1:2]) %>%
                          "Venom gland", "Non-venom")
   )
 
-cat("\nTissue PC loadings:\n")
-tissue_pca_positions %>%
-  dplyr::select(tissue, PC1, PC2) %>%
-  dplyr::arrange(desc(PC1)) %>%
-  print()
-
 # Gene coordinates with cleaned labels
 gene_coords <- as.data.frame(pca_res$rotation[, 1:3]) %>%
   rownames_to_column("Gene_ID") %>%
@@ -1059,90 +1057,78 @@ gene_coords <- as.data.frame(pca_res$rotation[, 1:3]) %>%
   dplyr::mutate(
     cluster_label = case_when(
       !is.na(cluster_label)             ~ cluster_label,
-      !is.na(PSG_enrichment) &
-        PSG_enrichment > 1              ~ "PSG Enriched",
-      !is.na(PSG_enrichment) &
-        PSG_enrichment > 0              ~ "PSG Moderate",
-      !is.na(PSG_enrichment) &
-        PSG_enrichment <= 0             ~ "ASG/Other",
+      !is.na(PSG_enrichment) & PSG_enrichment > 1   ~ "PSG Enriched",
+      !is.na(PSG_enrichment) & PSG_enrichment > 0   ~ "PSG Moderate",
+      !is.na(PSG_enrichment) & PSG_enrichment <= 0  ~ "ASG/Other",
       TRUE                              ~ "Unassigned"
     ),
-    # ---- Clean gene labels (all fixes applied here) ----
     gene_label = case_when(
-      grepl("FKBP|peptidyl.prolyl",
-            Description, ignore.case = TRUE)        ~ "FKBP prolyl isomerase",
-      grepl("voltage.gated calcium",
-            Description, ignore.case = TRUE)        ~ "Voltage-gated Ca2+ channel",
-      grepl("Amiloride",
-            Description, ignore.case = TRUE)        ~ "Amiloride-sensitive Na+ channel",
-      grepl("plus.end.directed",
-            Description, ignore.case = TRUE)        ~ "Kinesin (plus-end transport)",
-      grepl("Rab guanyl",
-            Description, ignore.case = TRUE)        ~ "Rab-GEF",
-      grepl("negative regulation of dense",
-            Description, ignore.case = TRUE)        ~ "Secretory granule regulation",
-      grepl("Golgi to secretory",
-            Description, ignore.case = TRUE)        ~ "Golgi to secretory granule",
-      grepl("vesicle.mediated transport",
-            Description, ignore.case = TRUE)        ~ "Vesicle-mediated transport",
-      grepl("protein disulfide",
-            Description, ignore.case = TRUE)        ~ "Protein disulfide oxidoreductase",
-      grepl("Ubiquitin.like",
-            Description, ignore.case = TRUE)        ~ "Ubiquitin-like modifier",
-      grepl("Ankyrin",
-            Description, ignore.case = TRUE)        ~ "Ankyrin repeats",
-      grepl("^cac$", Preferred_name,
-            ignore.case = TRUE)                     ~ "Cac (VGCC alpha1)",
-      grepl("Phosphatidylinositol",
-            Description, ignore.case = TRUE)        ~ "PI-PLC",
-      grepl("vesicle docking",
-            Description, ignore.case = TRUE)        ~ "Vesicle docking",
-      grepl("^exocytosis$",
-            Description, ignore.case = TRUE)        ~ "Exocytosis",
-      grepl("positive regulation of inte",
-            Description, ignore.case = TRUE)        ~ "Positive reg. of exocytosis",
-      grepl("C-type lectin",
-            Description, ignore.case = TRUE)        ~ "C-type lectin (CTL)",
-      grepl("Binds to the signal",
-            Description, ignore.case = TRUE)        ~ "Signal recognition particle",
-      grepl("Catalyzes the conversion",
-            Description, ignore.case = TRUE)        ~ "Enzyme (conversion)",
-      grepl("Regulates the GDP GTP",
-            Description, ignore.case = TRUE)        ~ "Rab-GEF regulator",
-      grepl("Secreted protein acidic",
-            Description, ignore.case = TRUE)        ~ "SPARC",
-      grepl("Rab GTPase.activating",
-            Description, ignore.case = TRUE)        ~ "Rab-GAP",
-      grepl("Synaptotagmin",
-            Description, ignore.case = TRUE)        ~ "Synaptotagmin-like",
-      grepl("Clathrin is the major",
-            Description, ignore.case = TRUE)        ~ "Clathrin",
-      grepl("cargo loading into COPII",
-            Description, ignore.case = TRUE)        ~ "COPII cargo loading",
-      grepl("Collagen triple helix",
-            Description, ignore.case = TRUE)        ~ "Collagen triple helix",
-      grepl("Leucine aminopeptidase",
-            Description, ignore.case = TRUE)        ~ "Leucine aminopeptidase",
-      grepl("aminopeptidase activity",
-            Description, ignore.case = TRUE)        ~ "Aminopeptidase",
-      grepl("phospholipase.*D.*activ",
-            Description, ignore.case = TRUE)        ~ "Phospholipase-D activator",
-      grepl("^Rop$", Preferred_name)                ~ NA_character_,
-      !is.na(Preferred_name) &
-        Preferred_name != "NA"                      ~ Preferred_name,
-      !is.na(Description)                           ~ str_trunc(
-        gsub('"', '', Description), 30),
-      TRUE                                          ~ str_trunc(Gene_ID, 20)
+      grepl("FKBP|peptidyl.prolyl", Description, ignore.case = TRUE) ~ "FKBP prolyl isomerase",
+      grepl("voltage.gated calcium", Description, ignore.case = TRUE) ~ "Voltage-gated Ca2+ channel",
+      grepl("Amiloride", Description, ignore.case = TRUE) ~ "Amiloride-sensitive Na+ channel",
+      grepl("plus.end.directed", Description, ignore.case = TRUE) ~ "Kinesin (plus-end transport)",
+      grepl("Rab guanyl", Description, ignore.case = TRUE) ~ "Rab-GEF",
+      grepl("negative regulation of dense", Description, ignore.case = TRUE) ~ "Secretory granule regulation",
+      grepl("Golgi to secretory", Description, ignore.case = TRUE) ~ "Golgi to secretory granule",
+      grepl("vesicle.mediated transport", Description, ignore.case = TRUE) ~ "Vesicle-mediated transport",
+      grepl("protein disulfide", Description, ignore.case = TRUE) ~ "Protein disulfide oxidoreductase",
+      grepl("Ubiquitin.like", Description, ignore.case = TRUE) ~ "Ubiquitin-like modifier",
+      grepl("Ankyrin", Description, ignore.case = TRUE) ~ "Ankyrin repeats",
+      grepl("^cac$", Preferred_name, ignore.case = TRUE) ~ "Cac (VGCC alpha1)",
+      grepl("Phosphatidylinositol", Description, ignore.case = TRUE) ~ "PI-PLC",
+      grepl("vesicle docking", Description, ignore.case = TRUE) ~ "Vesicle docking",
+      grepl("^exocytosis$", Description, ignore.case = TRUE) ~ "Exocytosis",
+      grepl("positive regulation of inte", Description, ignore.case = TRUE) ~ "Positive reg. of exocytosis",
+      grepl("C-type lectin", Description, ignore.case = TRUE) ~ "C-type lectin (CTL)",
+      grepl("Binds to the signal", Description, ignore.case = TRUE) ~ "Signal recognition particle",
+      grepl("Catalyzes the conversion", Description, ignore.case = TRUE) ~ "Enzyme (conversion)",
+      grepl("Regulates the GDP GTP", Description, ignore.case = TRUE) ~ "Rab-GEF regulator",
+      grepl("Secreted protein acidic", Description, ignore.case = TRUE) ~ "SPARC",
+      grepl("Rab GTPase.activating", Description, ignore.case = TRUE) ~ "Rab-GAP",
+      grepl("Synaptotagmin", Description, ignore.case = TRUE) ~ "Synaptotagmin-like",
+      grepl("Clathrin is the major", Description, ignore.case = TRUE) ~ "Clathrin",
+      grepl("cargo loading into COPII", Description, ignore.case = TRUE) ~ "COPII cargo loading",
+      grepl("Collagen triple helix", Description, ignore.case = TRUE) ~ "Collagen triple helix",
+      grepl("Leucine aminopeptidase", Description, ignore.case = TRUE) ~ "Leucine aminopeptidase",
+      grepl("aminopeptidase activity", Description, ignore.case = TRUE) ~ "Aminopeptidase",
+      grepl("phospholipase.*D.*activ", Description, ignore.case = TRUE) ~ "Phospholipase-D activator",
+      grepl("^Rop$", Preferred_name) ~ NA_character_,
+      !is.na(Preferred_name) & Preferred_name != "NA" ~ Preferred_name,
+      !is.na(Description) ~ str_trunc(gsub('"', '', Description), 30),
+      TRUE ~ str_trunc(Gene_ID, 20)
     ),
     point_size = pmax(PSG_enrichment, 0.1, na.rm = TRUE)
   ) %>%
   dplyr::filter(!is.na(gene_label))
 
-cat(sprintf("gene_coords: %d genes\n", nrow(gene_coords)))
-cat("Cluster distribution:\n")
-print(table(gene_coords$cluster_label, useNA = "ifany"))
+# Lock legend colors
+gene_coords$cluster_label <- factor(gene_coords$cluster_label, levels = names(cluster_colors))
 
-# Tissue arrows — proportionally scaled
+# Top labels — deduplicated + Nudges
+top_labels_clean <- gene_coords %>%
+  dplyr::filter(!is.na(cluster_label), cluster_label != "Unassigned", !is.na(PSG_enrichment), PC1 > 0.003) %>%
+  dplyr::group_by(gene_label) %>% dplyr::slice_max(PSG_enrichment, n = 1, with_ties = FALSE) %>% dplyr::ungroup() %>%
+  dplyr::arrange(desc(PSG_enrichment)) %>% dplyr::slice(1:16) %>%
+  dplyr::bind_rows(
+    gene_coords %>% dplyr::filter(!is.na(cluster_label), cluster_label != "Unassigned", PC1 < -0.012) %>%
+      dplyr::group_by(gene_label) %>% dplyr::slice_min(PSG_enrichment, n = 1, with_ties = FALSE) %>% dplyr::ungroup() %>%
+      dplyr::arrange(PSG_enrichment) %>% dplyr::slice(1:4)
+  ) %>% dplyr::filter(!duplicated(gene_label))
+
+top_labels_clean$cluster_label <- factor(top_labels_clean$cluster_label, levels = names(cluster_colors))
+
+top_labels_clean <- top_labels_clean %>%
+  dplyr::mutate(
+    nx = case_when(gene_label == "Rab-GAP" ~ 0.015, TRUE ~ 0),
+    ny = case_when(
+      gene_label == "Rab-GAP" ~ 0.01,  
+      gene_label == "Voltage-gated Ca2+ channel" ~ -0.015, 
+      gene_label == "Clathrin" ~ -0.015,  
+      TRUE ~ 0
+    )
+  )
+
+# Tissue arrows — proportionally scaled & pushed away from genes
 max_loading <- max(abs(tissue_pca_positions$PC1))
 arrow_max   <- max(abs(gene_coords$PC1)) * 0.60
 
@@ -1151,83 +1137,22 @@ tissue_arrows_v5 <- tissue_pca_positions %>%
     arrow_x = (PC1 / max_loading) * arrow_max,
     arrow_y = (PC2 / max(abs(PC2))) * arrow_max * 0.40,
     tissue_label = case_when(
-      tissue == "PSG"   ~ "PSG",
-      tissue == "asg"   ~ "ASG",
-      tissue == "BM"    ~ "Buccal\nMass",
-      tissue == "arm"   ~ "Arm",
-      tissue == "eso"   ~ "Esophagus",
-      tissue == "SU_ms" ~ "Supra.\nMass"
+      tissue == "PSG"   ~ "PSG", tissue == "asg"   ~ "ASG",
+      tissue == "BM"    ~ "Buccal\nMass", tissue == "arm"   ~ "Arm",
+      tissue == "eso"   ~ "Esophagus", tissue == "SU_ms" ~ "Supra.\nMass"
     ),
-    t_color = case_when(
-      tissue == "PSG" ~ "#8B0000",
-      tissue == "asg" ~ "#CC2200",
-      TRUE            ~ "#2166AC"
-    ),
+    t_color = case_when(tissue == "PSG" ~ "#8B0000", tissue == "asg" ~ "#CC2200", TRUE ~ "#2166AC"),
     label_x = case_when(
-      tissue == "SU_ms" ~ arrow_x * 1.3 - 0.005,
-      tissue == "PSG"   ~ arrow_x * 1.25,
-      TRUE              ~ arrow_x * 1.22
+      tissue == "PSG"   ~ arrow_x + 0.003, tissue == "asg"   ~ arrow_x - 0.005,  
+      tissue == "BM"    ~ arrow_x - 0.005, tissue == "eso"   ~ arrow_x - 0.005,
+      tissue == "arm"   ~ arrow_x, tissue == "SU_ms" ~ arrow_x + 0.004
     ),
     label_y = case_when(
-      tissue == "SU_ms" ~ arrow_y * 1.3 + 0.004,
-      TRUE              ~ arrow_y * 1.22
+      tissue == "PSG"   ~ arrow_y - 0.001, tissue == "asg"   ~ arrow_y + 0.004,  
+      tissue == "BM"    ~ arrow_y + 0.004, tissue == "eso"   ~ arrow_y - 0.004,
+      tissue == "arm"   ~ arrow_y - 0.006, tissue == "SU_ms" ~ arrow_y + 0.005
     )
   )
-
-# Density inset
-p_density <- gene_coords %>%
-  dplyr::filter(!is.na(cluster_label),
-                cluster_label != "Unassigned") %>%
-  ggplot(aes(x = PC1, fill = cluster_label, color = cluster_label)) +
-  geom_density(alpha = 0.5, linewidth = 0.7) +
-  geom_vline(xintercept = 0, linetype = "dashed",
-             color = "grey50", linewidth = 0.5) +
-  scale_fill_manual(values  = cluster_colors, guide = "none") +
-  scale_color_manual(values = cluster_colors, guide = "none") +
-  theme_bw(base_size = 8) +
-  labs(title = "PC1 distribution", x = "PC1", y = "Density") +
-  theme(
-    plot.title       = element_text(hjust = 0.5, size = 8, face = "bold"),
-    axis.text        = element_text(size = 7),
-    panel.grid.minor = element_blank(),
-    plot.background  = element_rect(fill = "white", color = "grey80",
-                                    linewidth = 0.5)
-  )
-
-# Top labels — deduplicated, zero duplicates
-top_labels_clean <- gene_coords %>%
-  # PSG side: top 16 by PSG enrichment
-  dplyr::filter(
-    !is.na(cluster_label),
-    cluster_label != "Unassigned",
-    !is.na(PSG_enrichment),
-    PC1 > 0.003
-  ) %>%
-  dplyr::group_by(gene_label) %>%
-  dplyr::slice_max(PSG_enrichment, n = 1, with_ties = FALSE) %>%
-  dplyr::ungroup() %>%
-  dplyr::arrange(desc(PSG_enrichment)) %>%
-  dplyr::slice(1:16) %>%
-  # ASG side: 4 most extreme
-  dplyr::bind_rows(
-    gene_coords %>%
-      dplyr::filter(
-        !is.na(cluster_label),
-        cluster_label != "Unassigned",
-        PC1 < -0.012
-      ) %>%
-      dplyr::group_by(gene_label) %>%
-      dplyr::slice_min(PSG_enrichment, n = 1, with_ties = FALSE) %>%
-      dplyr::ungroup() %>%
-      dplyr::arrange(PSG_enrichment) %>%
-      dplyr::slice(1:4)
-  ) %>%
-  dplyr::filter(!duplicated(gene_label))
-
-cat(sprintf("Labels: %d  |  Duplicates: %d\n",
-            nrow(top_labels_clean),
-            sum(duplicated(top_labels_clean$gene_label))))
-print(top_labels_clean$gene_label)
 
 
 # ==============================================================================
@@ -1236,233 +1161,81 @@ print(top_labels_clean$gene_label)
 
 cat("\n=== Section 15: Building final PCA plot ===\n")
 
+# Main Plot
 p_pca_final <- ggplot() +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "#B22222", alpha = 0.04) +
+  annotate("rect", xmin = -Inf, xmax = 0, ymin = -Inf, ymax = Inf, fill = "#2166AC", alpha = 0.04) +
+  
+  annotate("text", x = max(gene_coords$PC1) * 0.88, y = max(gene_coords$PC2) * 0.95, 
+           label = "PSG-enriched ->", color = "#8B0000", size = 4.5, fontface = "bold", hjust = 1) +
+  annotate("text", x = min(gene_coords$PC1) * 0.88, y = max(gene_coords$PC2) * 0.95, 
+           label = "<- ASG-enriched", color = "#1A4F7A", size = 4.5, fontface = "bold", hjust = 0) +
 
-  # Background shading
-  annotate("rect", xmin = 0,    xmax =  Inf,
-           ymin = -Inf, ymax =  Inf, fill = "#B22222", alpha = 0.04) +
-  annotate("rect", xmin = -Inf, xmax =  0,
-           ymin = -Inf, ymax =  Inf, fill = "#2166AC", alpha = 0.04) +
-
-  # Region labels (ASCII arrows — avoids PDF encoding warnings)
-  annotate("text",
-           x = max(gene_coords$PC1) * 0.88,
-           y = max(gene_coords$PC2) * 0.96,
-           label    = "PSG-enriched ->",
-           color    = "#8B0000",
-           size     = 4.5,
-           fontface = "bold",
-           hjust    = 1) +
-  annotate("text",
-           x = min(gene_coords$PC1) * 0.88,
-           y = max(gene_coords$PC2) * 0.96,
-           label    = "<- ASG-enriched",
-           color    = "#1A4F7A",
-           size     = 4.5,
-           fontface = "bold",
-           hjust    = 0) +
-
-  # Reference lines
-  geom_hline(yintercept = 0, linetype = "dashed",
-             color = "grey70", linewidth = 0.4) +
-  geom_vline(xintercept = 0, linetype = "dashed",
-             color = "grey70", linewidth = 0.4) +
-
-  # Gene points
-  geom_point(
-    data = gene_coords %>%
-      dplyr::filter(!is.na(cluster_label),
-                    cluster_label != "Unassigned"),
-    aes(x     = PC1,
-        y     = PC2,
-        color = cluster_label,
-        size  = pmax(PSG_enrichment, 0.1, na.rm = TRUE)),
-    alpha = 0.65,
-    shape = 16
-  ) +
-
-  # Tissue arrows
-  geom_segment(
-    data = tissue_arrows_v5,
-    aes(x = 0, y = 0, xend = arrow_x, yend = arrow_y),
-    color     = tissue_arrows_v5$t_color,
-    arrow     = arrow(length = unit(0.30, "cm"), type = "closed"),
-    linewidth = 1.6,
-    alpha     = 0.88
-  ) +
-
-  # Tissue labels
-  geom_label(
-    data = tissue_arrows_v5,
-    aes(x = label_x, y = label_y, label = tissue_label),
-    color      = tissue_arrows_v5$t_color,
-    size       = 3.5,
-    fontface   = "bold",
-    linewidth  = 0.4,        # replaces deprecated label.size
-    fill       = "white",
-    alpha      = 0.93,
-    lineheight = 0.9
-  ) +
-
-  # Gene labels — clean, deduplicated
-  geom_label_repel(
-    data          = top_labels_clean,
-    aes(x         = PC1,
-        y         = PC2,
-        label     = gene_label,
-        color     = cluster_label),
-    size          = 2.8,
-    fontface      = "italic",
-    box.padding   = 0.6,
-    point.padding = 0.4,
-    max.overlaps  = 25,
-    linewidth     = 0.2,     # replaces deprecated label.size
-    fill          = alpha("white", 0.92),
-    segment.color = "grey55",
-    segment.size  = 0.35,
-    show.legend   = FALSE,
-    seed          = 42,
-    force         = 2
-  ) +
-
-  scale_color_manual(
-    values = cluster_colors,
-    name   = "Expression\ncluster",
-    guide  = guide_legend(
-      override.aes = list(size = 4, alpha = 1, shape = 16)
-    )
-  ) +
-  scale_size_continuous(
-    name   = "PSG enrichment\n(VST units)",
-    range  = c(0.8, 7),
-    breaks = c(2, 4, 6, 8),
-    labels = c("+2", "+4", "+6", "+8")
-  ) +
-
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.4) +
+  
+  geom_point(data = gene_coords %>% dplyr::filter(!is.na(cluster_label), cluster_label != "Unassigned"),
+             aes(x = PC1, y = PC2, color = cluster_label, size = pmax(PSG_enrichment, 0.1, na.rm = TRUE)), alpha = 0.65, shape = 16) +
+  
+  geom_segment(data = tissue_arrows_v5, aes(x = 0, y = 0, xend = arrow_x, yend = arrow_y), 
+               color = tissue_arrows_v5$t_color, arrow = arrow(length = unit(0.30, "cm"), type = "closed"), linewidth = 1.6, alpha = 0.88) +
+  
+  geom_label(data = tissue_arrows_v5, aes(x = label_x, y = label_y, label = tissue_label), 
+             color = tissue_arrows_v5$t_color, size = 3.5, fontface = "bold", linewidth = 0.4, fill = "white", alpha = 0.93) +
+  
+  geom_label_repel(data = top_labels_clean, aes(x = PC1, y = PC2, label = gene_label, color = cluster_label), 
+                   nudge_x = top_labels_clean$nx, nudge_y = top_labels_clean$ny, 
+                   size = 2.8, fontface = "italic", box.padding = 1.2, point.padding = 0.5, max.overlaps = 50, 
+                   fill = alpha("white", 0.92), show.legend = FALSE, seed = 42) +
+  
+  scale_color_manual(values = cluster_colors, name = "Expression\ncluster", drop = FALSE, guide = guide_legend(override.aes = list(size = 4, alpha = 1, shape = 16))) +
+  scale_size_continuous(name = "PSG enrichment\n(VST units)", range = c(0.8, 7), breaks = c(2, 4, 6, 8), labels = c("+2", "+4", "+6", "+8")) +
+  
   coord_fixed(ratio = 1) +
   theme_bw(base_size = 12) +
-  labs(
-    title    = expression(
-      italic("T. pacificus") ~
-        "Venom Gene Expression Space — PCA"
-    ),
-    subtitle = paste0(
-      "n = 1,828 venom-related genes  |  ",
-      "Arrows proportional to tissue loading  |  ",
-      "Point size = PSG enrichment (VST)"
-    ),
-    x = sprintf(
-      "PC1 — %.1f%% variance  (PSG: +47.9 | ASG: -18.8 | all non-venom negative)",
-      pct_var[1]
-    ),
-    y = sprintf(
-      "PC2 — %.1f%% variance  (ASG: +27.1 | Arm: -32.8)",
-      pct_var[2]
-    ),
-    caption = paste0(
-      "PSG = Posterior Salivary Gland  |  ",
-      "ASG = Accessory Salivary Gland  |  ",
-      "Arrow length proportional to tissue PC loading  |  ",
-      "Red = venom glands, Blue = non-venom tissues"
-    )
-  ) +
-  theme(
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 14),
-    plot.subtitle    = element_text(hjust = 0.5, size = 9, color = "grey35"),
-    plot.caption     = element_text(size = 7.5, color = "grey50", hjust = 0),
-    legend.position  = "right",
-    legend.box       = "vertical",
-    panel.grid.major = element_line(color = "grey93"),
-    panel.grid.minor = element_blank(),
-    plot.background  = element_rect(fill = "white", color = NA)
-  )
+  labs(title = expression(italic("T. pacificus") ~ "Venom Gene Expression Space — PCA"),
+       x = sprintf("PC1 — %.1f%% variance  (PSG: +47.9 | ASG: -18.8 | all non-venom negative)", pct_var[1]),
+       y = sprintf("PC2 — %.1f%% variance  (ASG: +27.1 | Arm: -32.8)", pct_var[2])) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        panel.grid.minor = element_blank(), plot.background = element_rect(fill = "white", color = NA))
 
-# Add density inset — ORIGINAL BOTTOM-LEFT position
-p_pca_with_inset <- p_pca_final +
-  inset_element(
-    p_density,
-    left   = 0.01,
-    bottom = 0.01,
-    right  = 0.28,
-    top    = 0.28
-  )
+# Density Plot
+p_density <- gene_coords %>%
+  dplyr::filter(!is.na(cluster_label), cluster_label != "Unassigned") %>%
+  ggplot(aes(x = PC1, fill = cluster_label, color = cluster_label)) +
+  geom_density(alpha = 0.5, linewidth = 0.7) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+  scale_fill_manual(values = cluster_colors, guide = "none") +
+  scale_color_manual(values = cluster_colors, guide = "none") +
+  theme_bw(base_size = 9) +
+  labs(title = "PC1 distribution", x = "PC1", y = "Density") +
+  theme(plot.title = element_text(hjust = 0.5, size = 10, face = "bold"),
+        panel.grid.minor = element_blank(), plot.background = element_blank(), 
+        panel.background = element_rect(fill = "white", color = "grey80"),
+        plot.margin = margin(t = 10, r = 10, b = 10, l = 10)) 
 
-# Save
-ggsave("venom_genes_PCA_FINAL_clean.pdf",
-       p_pca_with_inset,
-       width  = 14,
-       height = 11,
-       bg     = "white")
+# Combine using cowplot layout
+shared_legend <- get_legend(p_pca_final)
+p_pca_main <- p_pca_final + theme(legend.position = "none")
 
-ggsave("venom_genes_PCA_FINAL_clean.png",
-       p_pca_with_inset,
-       width  = 14,
-       height = 11,
-       dpi    = 300,
-       bg     = "white")
+right_column <- plot_grid(
+  shared_legend, 
+  NULL,          
+  p_density, 
+  ncol = 1, 
+  rel_heights = c(1.2, 0.4, 0.8) 
+)
+
+p_pca_with_inset <- plot_grid(
+  p_pca_main, 
+  right_column, 
+  nrow = 1, 
+  rel_widths = c(1, 0.28) 
+)
+
+# Save using the original filenames expected by Section 16
+ggsave("venom_genes_PCA_FINAL_clean.pdf", p_pca_with_inset, width = 14, height = 10, bg = "white")
+ggsave("venom_genes_PCA_FINAL_clean.png", p_pca_with_inset, width = 14, height = 10, dpi = 300, bg = "white")
 
 cat("Saved: venom_genes_PCA_FINAL_clean.pdf\n")
 cat("Saved: venom_genes_PCA_FINAL_clean.png\n")
-
-
-# ==============================================================================
-# SECTION 16: SESSION INFO + FINAL SUMMARY
-# ==============================================================================
-
-cat("\n")
-cat("=======================================================\n")
-cat(" ANALYSIS COMPLETE\n")
-cat("=======================================================\n")
-
-cat("\nExpression data:\n")
-cat(sprintf("  Genes imported:            %d\n", nrow(txi$counts)))
-cat(sprintf("  Genes after VST filter:    %d\n", nrow(vst_fc)))
-cat(sprintf("  Genes >=2-fold variable:   %d\n", length(genes_1xFC)))
-
-cat("\nAnnotation:\n")
-cat(sprintf("  EggNOG annotated genes:    %d (%.1f%%)\n",
-            nrow(eggnog_dedup),
-            100 * nrow(eggnog_dedup) / length(expr_ids)))
-cat(sprintf("  Venom-related genes:       %d\n", nrow(all_venom_genes)))
-
-cat("\nGSEA:\n")
-cat(sprintf("  GO BP PSG vs ASG:          %d terms\n",
-            nrow(as.data.frame(gsea_BP[["PSG_vs_ASG"]]))))
-cat(sprintf("  KEGG PSG vs ASG:           %d terms\n",
-            nrow(as.data.frame(gsea_KEGG[["PSG_vs_ASG"]]))))
-
-cat("\nOutput files:\n")
-output_files <- c(
-  "ALL_T_pacificus_Normalized_Genes.csv",
-  "eggnog_all_genes_annotated.csv",
-  "eggnog_filtered_2fold_annotated.csv",
-  "custom_annotation_databases.RData",
-  "GSEA_results.RData",
-  "GSEA_BP_PSG_vs_ASG.csv",
-  "GSEA_MF_PSG_vs_ASG.csv",
-  "GSEA_CC_PSG_vs_ASG.csv",
-  "GSEA_KEGG_PSG_vs_ASG.csv",
-  "GSEA_BP_PSG_vs_all.csv",
-  "GSEA_BP_ASG_vs_all.csv",
-  "GSEA_KEGG_PSG_vs_all.csv",
-  "GSEA_KEGG_ASG_vs_all.csv",
-  "venom_related_genes_annotated.csv",
-  "PSG_venom_genes_summary.csv",
-  "venom_genes_clusters.csv",
-  "GSEA_dotplot_BP_PSG_vs_ASG.pdf",
-  "GSEA_dotplot_MF_PSG_vs_ASG.pdf",
-  "GSEA_dotplot_KEGG_PSG_vs_ASG.pdf",
-  "GSEA_NES_barplot_PSG_vs_ASG.pdf",
-  "GSEA_NES_heatmap_all_tissues.pdf",
-  "venom_genes_PCA_FINAL_clean.pdf",
-  "venom_genes_PCA_FINAL_clean.png"
-)
-for (f in output_files) {
-  cat(sprintf("  [%s] %s\n",
-              ifelse(file.exists(f), "OK    ", "MISSING"), f))
-}
-
-sink("session_info.txt")
-sessionInfo()
-sink()
-cat("\nSession info saved: session_info.txt\n")
