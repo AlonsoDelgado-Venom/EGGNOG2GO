@@ -1,0 +1,140 @@
+# ===============================
+# Part 3: TF–Venom Gene Analysis (eggNOG2GO pipeline)
+# ===============================
+
+# ---- Load Libraries ----
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(igraph)
+library(ggraph)
+library(pheatmap)
+library(patchwork)
+
+# ---- Load Data ----
+tf_mod        <- read.csv("PLB_TF_candidates.csv", stringsAsFactors = FALSE)
+psg_venom_mod <- read.csv("PSG_venom_genes_summary.csv", stringsAsFactors = FALSE)
+module_df     <- read.csv("WGCNA_gene_module_assignments.csv", stringsAsFactors = FALSE)
+norm_expr     <- read.csv("ALL_T_pacificus_Normalized_Genes.csv", stringsAsFactors = FALSE)
+eggnog_annot  <- read.csv("eggnog_all_genes_annotated.csv", stringsAsFactors = FALSE)
+
+# ---- Attach Module Info (if not present) ----
+if (!"module_color" %in% names(tf_mod)) {
+  tf_mod <- left_join(tf_mod, module_df, by = "Gene_ID")
+}
+if (!"module_color" %in% names(psg_venom_mod)) {
+  psg_venom_mod <- left_join(psg_venom_mod, module_df, by = "Gene_ID")
+}
+
+# ---- Identify Core Venom Genes ----
+toxin_keywords <- c(
+  "toxin", "phospholipase", "metalloprotease", "serine protease", "hyaluronidase",
+  "CRISP", "kunitz", "lectin", "chitinase", "neurotoxin", "cytolysin", "PLA2"
+)
+psg_venom_mod_core <- psg_venom_mod %>%
+  filter(
+    grepl(paste(toxin_keywords, collapse = "|"), gene_label, ignore.case = TRUE) |
+    grepl(paste(toxin_keywords, collapse = "|"), Description, ignore.case = TRUE)
+  )
+
+# ---- TF–Venom Gene Co-expression Pairs (Same Module) ----
+tf_psg_venom_pairs_core <- inner_join(
+  tf_mod %>% select(TF_Gene_ID = Gene_ID, TF_label = TF_Type, module_color),
+  psg_venom_mod_core %>% select(Venom_Gene_ID = Gene_ID, Venom_label = gene_label, Venom_Description = Description, module_color),
+  by = "module_color"
+)
+write.csv(tf_psg_venom_pairs_core, "TF_PSG_enriched_CORE_venom_gene_pairs.csv", row.names = FALSE)
+
+# ---- Build igraph Network ----
+nodes <- data.frame(
+  name = unique(c(tf_psg_venom_pairs_core$TF_label, tf_psg_venom_pairs_core$Venom_label)),
+  type = c(rep("TF", length(unique(tf_psg_venom_pairs_core$TF_label))),
+           rep("Venom", length(unique(tf_psg_venom_pairs_core$Venom_label))))
+)
+edges <- tf_psg_venom_pairs_core %>%
+  select(from = TF_label, to = Venom_label)
+g_venom <- graph_from_data_frame(edges, vertices = nodes, directed = FALSE)
+
+# ---- Robustness Analysis: Knockout Top TF Hubs ----
+tf_nodes <- V(g_venom)[V(g_venom)$type == "TF"]
+tf_degrees <- degree(g_venom, v = tf_nodes)
+top_hubs <- names(sort(tf_degrees, decreasing = TRUE))[1:3]
+for (hub in top_hubs) {
+  g_removed <- delete_vertices(g_venom, hub)
+  venom_nodes <- V(g_removed)[V(g_removed)$type == "Venom"]
+  venom_degrees <- degree(g_removed, v = venom_nodes)
+  n_disconnected <- sum(venom_degrees == 0)
+  n_components <- components(g_removed)$no
+  cat("\nAfter removing TF hub", hub, ":\n")
+  cat("  Disconnected venom genes:", n_disconnected, "\n")
+  cat("  Number of connected components:", n_components, "\n")
+}
+
+# ---- Degree Distribution (Venom Genes) ----
+venom_nodes <- V(g_venom)[V(g_venom)$type == "Venom"]
+deg_vals <- degree(g_venom, v = venom_nodes)
+deg_df <- data.frame(Degree = deg_vals)
+ggplot(deg_df, aes(x = as.factor(Degree))) +
+  geom_bar(fill = "firebrick") +
+  labs(title = "TF Connections per Venom Gene", x = "Number of TFs", y = "Number of Venom Genes") +
+  theme_minimal(base_size = 14)
+ggsave("venom_gene_degree_distribution.png", width = 7, height = 5, dpi = 300)
+
+# ---- Cumulative Distribution Curve ----
+deg_curve <- deg_df %>%
+  group_by(Degree) %>%
+  summarise(N = n()) %>%
+  arrange(Degree) %>%
+  mutate(
+    Cumulative = cumsum(N) / sum(N),
+    ReverseCumulative = rev(cumsum(rev(N))) / sum(N)
+  )
+ggplot(deg_curve, aes(x = Degree, y = Cumulative)) +
+  geom_line(size = 1.5, color = "firebrick") +
+  geom_point(size = 3, color = "firebrick") +
+  labs(title = "Cumulative Distribution: TF Connections per Venom Gene", x = "Number of TFs", y = "Fraction of Venom Genes (≤ Degree)") +
+  theme_minimal(base_size = 14)
+ggsave("venom_gene_degree_cdf.png", width = 7, height = 5, dpi = 300)
+
+# ---- PSG 2-Fold Enrichment Analysis ----
+norm_expr$mean_nonpsg <- rowMeans(norm_expr[,c("asg", "BM", "arm", "eso", "SU_ms")])
+norm_expr$psg_2fold <- norm_expr$PSG > 2 * norm_expr$mean_nonpsg
+psg_2fold_genes <- norm_expr %>%
+  filter(psg_2fold, Gene_ID %in% tf_psg_venom_pairs_core$Venom_Gene_ID)
+psg_2fold_genes$enrichment_ratio <- psg_2fold_genes$PSG / psg_2fold_genes$mean_nonpsg
+
+# ---- Annotate PSG-Enriched Genes ----
+psg_2fold_genes_annot <- left_join(
+  psg_2fold_genes,
+  eggnog_annot[, c("Gene_ID", "Description", "Preferred_name", "COG_category", "GOs", "PFAMs")],
+  by = "Gene_ID"
+)
+write.csv(psg_2fold_genes_annot, "PSG_2fold_enriched_venom_genes_annotated.csv", row.names = FALSE)
+
+# ---- Visualize Top 15 PSG-Expressed Venom Genes ----
+venom_expr <- norm_expr %>%
+  filter(Gene_ID %in% psg_venom_mod$Gene_ID) %>%
+  left_join(psg_venom_mod %>% select(Gene_ID, gene_label, Description), by = "Gene_ID")
+top15 <- venom_expr %>%
+  arrange(desc(PSG)) %>%
+  slice(1:15)
+top15_long <- top15 %>%
+  pivot_longer(cols = c("PSG", "asg", "BM", "arm", "eso", "SU_ms"), names_to = "Tissue", values_to = "Expression")
+top15_long$plot_label <- ifelse(!is.na(top15_long$gene_label) & top15_long$gene_label != "", top15_long$gene_label, top15_long$Gene_ID)
+plots <- lapply(split(top15_long, top15_long$Gene_ID), function(df) {
+  ggplot(df, aes(x = Tissue, y = Expression, fill = Tissue)) +
+    geom_bar(stat = "identity", color = "black") +
+    scale_fill_brewer(palette = "Set1") +
+    labs(title = unique(df$plot_label)) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "none", plot.title = element_text(size = 10, face = "bold"))
+})
+multi_plot <- wrap_plots(plots, nrow = 5, ncol = 3)
+ggsave("Top15_PSG_venom_gene_expression.png", multi_plot, width = 18, height = 20, dpi = 300)
+
+# ---- END OF SCRIPT ----
+
+# README: 
+# This script identifies and visualizes core PSG-enriched venom genes and their TF regulators,
+# evaluates network robustness, and summarizes key annotation and expression features.
+# Adjust file paths and column names as needed for your project.
